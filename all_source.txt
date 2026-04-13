@@ -1,0 +1,5295 @@
+===== ./cli/audit.py =====
+# cli/audit.py
+import asyncio
+import json
+
+import typer
+from rich.console import Console
+
+from core.session import run_audit, run_qa
+from core.chains import CHAINS, resolve_chain
+from report.renderer import (
+    render_audit, render_spinner_start,
+    render_stream_token, render_error,
+)
+
+console = Console()
+app     = typer.Typer()
+
+
+def audit_command(
+    address: str,
+    chain:   str,
+    config:  dict,
+    model_override: str | None = None,
+    no_stream: bool = False,
+    qa_mode: bool = True,
+):
+    """Core audit flow — callable from main CLI."""
+    if model_override:
+        config["openrouter"]["model"] = model_override
+
+    render_spinner_start(
+        address, chain, config["openrouter"]["model"]
+    )
+
+    async def _run():
+        try:
+            contract, result = await run_audit(
+                address, chain, config, stream=not no_stream
+            )
+        except ValueError as e:
+            render_error(str(e))
+            raise typer.Exit(1)
+        except Exception as e:
+            render_error(f"Fetch failed: {e}")
+            raise typer.Exit(1)
+
+        if no_stream:
+            # result is already a dict
+            render_audit(result, address, chain)
+            report = result
+        else:
+            # result is an async generator — stream tokens then parse
+            raw_json = ""
+            async for token in result:
+                render_stream_token(token)
+                raw_json += token
+            console.print()
+            try:
+                report = json.loads(raw_json)
+            except json.JSONDecodeError:
+                render_error("AI returned malformed JSON — try again.")
+                raise typer.Exit(1)
+            render_audit(report, address, chain)
+
+        # Interactive Q&A loop
+        if qa_mode:
+            history = []
+            while True:
+                try:
+                    question = console.input(
+                        "\n[bold cyan]💬 Ask a follow-up[/bold cyan] "
+                        "[dim](or press Enter to exit)[/dim]: "
+                    ).strip()
+                except (KeyboardInterrupt, EOFError):
+                    break
+                if not question:
+                    break
+
+                qa_gen = await run_qa(
+                    address, chain, config, history, question
+                )
+                console.print("\n[cyan]AI:[/cyan] ", end="")
+                answer = ""
+                async for tok in qa_gen:
+                    render_stream_token(tok)
+                    answer += tok
+                console.print()
+
+                history.append({"role": "user",      "content": question})
+                history.append({"role": "assistant",  "content": answer})
+
+    asyncio.run(_run())
+===== ./cli/wallet_cmd.py =====
+# cli/wallet_cmd.py
+"""
+dexai wallet 0xAddress --chain eth
+Fetches all token holdings and audits each one.
+"""
+import asyncio
+import json
+import typer
+from rich.console import Console
+
+from core.wallet_session import run_wallet_tracker
+from report.portfolio_renderer import render_wallet_report, render_wallet_spinner
+
+console = Console()
+
+
+def wallet_command(
+    address:  str,
+    chain:    str,
+    config:   dict,
+    json_out: bool = False,
+):
+    render_wallet_spinner(address, chain)
+
+    async def _run():
+        try:
+            data = await run_wallet_tracker(address, chain, config)
+        except ValueError as e:
+            console.print(f"\n[red]✗ {e}[/red]\n")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"\n[red]✗ Error: {e}[/red]\n")
+            raise typer.Exit(1)
+
+        if json_out:
+            console.print_json(json.dumps(data, default=str))
+        else:
+            render_wallet_report(data)
+
+    asyncio.run(_run())
+===== ./cli/wallet.py =====
+"""
+cli/wallet.py
+Wallet forensics — analyze a wallet's on-chain behavior.
+"""
+from rich.console import Console
+
+from fetchers.etherscan import (
+    get_native_balance, get_tx_list, CHAINS
+)
+from ai.client import OpenRouterClient, OpenRouterError
+from ai.prompt_builder import build_wallet_prompt
+from report.renderer import render_wallet_report, render_error, render_warning
+from utils.validators import is_valid_address
+from core.config import validate_config
+
+console = Console()
+
+
+async def wallet_command(
+    address: str,
+    chain:   str,
+    config:  dict,
+):
+    """Analyze a wallet's transaction history and risk profile."""
+
+    issues = validate_config(config)
+    for issue in issues:
+        if issue.startswith("❌"):
+            render_error(issue)
+            return
+        render_warning(issue)
+
+    if not is_valid_address(address):
+        render_error(f"Invalid address: {address}")
+        return
+
+    if chain not in CHAINS:
+        render_error(f"Unknown chain: {chain}")
+        return
+
+    chain_id   = CHAINS[chain]["id"]
+    chain_name = CHAINS[chain]["name"]
+    api_key    = config["explorers"].get("etherscan", "")
+
+    console.print(
+        f"\n[bold cyan]🔎 Wallet Analysis[/bold cyan] "
+        f"[dim]{address[:10]}...{address[-8:]}[/dim] "
+        f"on [cyan]{chain_name}[/cyan]\n"
+    )
+
+    with console.status("[bold cyan]Fetching wallet data...[/]", spinner="dots"):
+        balance = await get_native_balance(address, chain_id, api_key)
+        txs     = await get_tx_list(address, chain_id, api_key, limit=30)
+
+    native_symbols = {"eth": "ETH", "bsc": "BNB", "polygon": "MATIC",
+                      "arb": "ETH", "base": "ETH", "op": "ETH"}
+
+    wallet = {
+        "address":       address,
+        "chain":         chain,
+        "chain_id":      chain_id,
+        "chain_name":    chain_name,
+        "balance":       balance,
+        "native_symbol": native_symbols.get(chain, "ETH"),
+        "transactions":  txs,
+    }
+
+    console.print(
+        f"[dim]Balance: {balance} {wallet['native_symbol']}  "
+        f"Transactions fetched: {len(txs)}[/dim]\n"
+    )
+
+    # AI analysis
+    messages = build_wallet_prompt(wallet)
+
+    or_client = OpenRouterClient(
+        api_key    = config["openrouter"]["api_key"],
+        model      = config["openrouter"]["model"],
+        max_tokens = 2000,
+    )
+
+    with console.status("[bold cyan]Running AI analysis...[/]", spinner="dots"):
+        try:
+            analysis = await or_client.complete(messages)
+        except OpenRouterError as e:
+            render_error(f"AI error: {e}")
+            return
+
+    render_wallet_report(wallet, analysis)
+===== ./cli/config_cmd.py =====
+# cli/config_cmd.py
+import json
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import box
+
+from core.config import load_config, save_config, set_value, DEFAULT_CONFIG
+from ai.models import list_models
+
+console = Console()
+app     = typer.Typer(help="Manage DexAI settings.")
+
+
+@app.command("show")
+def show_config():
+    """Print current config (keys are masked)."""
+    config = load_config()
+    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    t.add_column("Key",   style="bold cyan", width=30)
+    t.add_column("Value", width=50)
+
+    def _add(key, val):
+        if "key" in key.lower() and val:
+            val = val[:8] + "..." + val[-4:]
+        t.add_row(key, str(val))
+
+    for section, data in config.items():
+        if isinstance(data, dict):
+            for k, v in data.items():
+                _add(f"{section}.{k}", v)
+        else:
+            _add(section, data)
+    console.print(t)
+
+
+@app.command("set")
+def set_cmd(
+    key:   str = typer.Argument(..., help="e.g. openrouter.api_key"),
+    value: str = typer.Argument(..., help="New value"),
+):
+    """Set a config value.  dexai config set openrouter.model deepseek/deepseek-r1"""
+    set_value(key, value)
+
+
+@app.command("models")
+def list_models_cmd():
+    """Show all available OpenRouter models."""
+    t = Table(title="Available Models", box=box.SIMPLE_HEAVY)
+    t.add_column("Key",   style="cyan")
+    t.add_column("Label", style="bold")
+    t.add_column("Cost (in/out per 1M tok)")
+    t.add_column("Note", style="dim")
+
+    for m in list_models():
+        cost = "FREE" if m["cost_in"] == 0 else f"${m['cost_in']:.2f} / ${m['cost_out']:.2f}"
+        t.add_row(m["key"], m["label"], cost, m["note"])
+    console.print(t)
+
+
+@app.command("reset")
+def reset_config(
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Reset all config to defaults."""
+    if not confirm:
+        typer.confirm("This will erase your config. Continue?", abort=True)
+    save_config(DEFAULT_CONFIG)
+    console.print("[green]✓ Config reset to defaults.[/green]")
+===== ./cli/deployer_cmd.py =====
+# cli/deployer_cmd.py
+"""
+CLI command: dexai deployer <wallet_address>
+
+Runs full deployer forensics — finds every contract they've deployed
+across chains, enriches with token data, and runs AI risk analysis.
+"""
+import asyncio
+import json
+
+import typer
+from rich.console import Console
+
+from core.deployer_session import run_deployer_analysis
+from core.chains import CHAINS
+from report.deployer_renderer import (
+    render_deployer_report,
+    render_deployer_spinner,
+)
+
+console = Console()
+
+# Default chains to scan (most active rug chains)
+DEFAULT_CHAINS = ["eth", "bsc", "polygon", "base", "arb"]
+
+
+def deployer_command(
+    address: str,
+    config: dict,
+    chains: list[str] | None = None,
+    model_override: str | None = None,
+    no_stream: bool = False,
+    output_json: bool = False,
+):
+    """Core deployer forensics flow."""
+    if model_override:
+        config["openrouter"]["model"] = model_override
+
+    chains_to_scan = chains or DEFAULT_CHAINS
+
+    render_deployer_spinner(address, chains_to_scan)
+
+    async def _run():
+        try:
+            profile, result = await run_deployer_analysis(
+                address, config,
+                chains=chains_to_scan,
+                stream=not no_stream,
+            )
+        except ValueError as e:
+            console.print(f"\n[red]✗ {e}[/red]\n")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"\n[red]✗ Error: {e}[/red]\n")
+            raise typer.Exit(1)
+
+        if no_stream:
+            report = result
+        else:
+            raw_json = ""
+            async for token in result:
+                raw_json += token
+            console.print()
+            try:
+                report = json.loads(raw_json)
+            except json.JSONDecodeError:
+                console.print("[red]✗ AI returned malformed JSON — try again[/red]")
+                raise typer.Exit(1)
+
+        if output_json:
+            console.print_json(json.dumps({
+                "profile": profile,
+                "analysis": report,
+            }))
+        else:
+            render_deployer_report(report, profile)
+
+        # Show the contract addresses for quick follow-up auditing
+        deployments = profile.get("deployments", [])
+        if deployments and not output_json:
+            console.print(
+                "\n[dim]Tip: Audit individual contracts with:[/dim]"
+            )
+            for d in deployments[:3]:
+                console.print(
+                    f"  [cyan]dexai audit {d['contract_address']} "
+                    f"--chain {d['chain']}[/cyan]"
+                )
+            console.print()
+
+    asyncio.run(_run())
+===== ./cli/__init__.py =====
+===== ./cli/watch_cmd.py =====
+# cli/watch_cmd.py
+"""
+Portfolio monitor commands:
+  dexai watch add    0xABC --chain bsc --label "My Token"
+  dexai watch remove 0xABC --chain bsc
+  dexai watch list
+  dexai watch scan           (one-shot scan all)
+  dexai watch run            (continuous loop)
+"""
+import asyncio
+import time
+import typer
+from rich.console import Console
+
+from core.watchlist import (
+    add_entry, remove_entry, list_entries, count,
+)
+from core.monitor_session import run_monitor_cycle
+from report.portfolio_renderer import (
+    render_watchlist, render_monitor_results, render_monitor_spinner,
+)
+from utils.validators import is_valid_address
+
+console = Console()
+app     = typer.Typer(help="Portfolio monitor — watch contracts for risk changes.")
+
+
+@app.command("add")
+def watch_add(
+    address:   str   = typer.Argument(..., help="Contract address to watch"),
+    chain:     str   = typer.Option("eth", "--chain", "-c"),
+    label:     str   = typer.Option("",    "--label", "-l", help="Friendly name"),
+    threshold: float = typer.Option(6.0,   "--threshold", "-t",
+                                    help="Risk score threshold to trigger alert (0-10)"),
+):
+    """Add a contract to your watchlist."""
+    if not is_valid_address(address):
+        console.print(f"[red]✗ Invalid address: {address}[/red]")
+        raise typer.Exit(1)
+    entry = add_entry(address, chain, label=label, alert_threshold=threshold)
+    console.print(
+        f"\n[green]✓ Added[/green]  {entry['label']}  "
+        f"[{chain.upper()}]  threshold={threshold}\n"
+        f"  Run [bold]dexai watch scan[/bold] to check it now.\n"
+    )
+
+
+@app.command("remove")
+def watch_remove(
+    address: str = typer.Argument(...),
+    chain:   str = typer.Option("eth", "--chain", "-c"),
+):
+    """Remove a contract from your watchlist."""
+    if remove_entry(address, chain):
+        console.print(f"[green]✓ Removed[/green] {address[:12]}… from {chain.upper()}")
+    else:
+        console.print(f"[yellow]Not found in watchlist.[/yellow]")
+
+
+@app.command("list")
+def watch_list():
+    """Show all watched contracts with their latest risk scores."""
+    entries = list_entries()
+    render_watchlist(entries)
+
+
+@app.command("scan")
+def watch_scan(
+    all_results: bool = typer.Option(False, "--all", "-a",
+                                     help="Show all results, not just alerts"),
+):
+    """One-shot scan of all watched contracts."""
+    entries = list_entries()
+    if not entries:
+        console.print("\n[dim]Watchlist is empty. Add contracts:[/dim]")
+        console.print("  [bold]dexai watch add 0xABC --chain bsc[/bold]\n")
+        raise typer.Exit(0)
+
+    from core.config import load_config, validate_keys
+    config = load_config()
+    if not validate_keys(config):
+        raise typer.Exit(1)
+
+    console.print(f"\n[cyan]⟳[/cyan]  Scanning {len(entries)} watched contracts…\n")
+
+    async def _run():
+        results = await run_monitor_cycle(config)
+        if all_results:
+            render_monitor_results(results)
+        else:
+            alerts = [r for r in results if r.get("alert") or r.get("error")]
+            render_monitor_results(alerts if alerts else results[:1])
+
+    asyncio.run(_run())
+
+
+@app.command("run")
+def watch_run(
+    interval: int  = typer.Option(30,   "--interval", "-i",
+                                  help="Check interval in minutes"),
+    once:     bool = typer.Option(False, "--once",
+                                  help="Run one cycle then exit"),
+):
+    """
+    Continuous portfolio monitor — checks all watched contracts on a schedule.
+
+    Example:
+      dexai watch run --interval 15
+    """
+    entries = list_entries()
+    if not entries:
+        console.print("\n[dim]Watchlist empty. Add contracts first:[/dim]")
+        console.print("  [bold]dexai watch add 0xABC --chain bsc[/bold]\n")
+        raise typer.Exit(0)
+
+    from core.config import load_config, validate_keys
+    config = load_config()
+    if not validate_keys(config):
+        raise typer.Exit(1)
+
+    render_monitor_spinner(len(entries), interval)
+
+    async def _loop():
+        while True:
+            results = await run_monitor_cycle(config)
+            render_monitor_results(results)
+            if once:
+                break
+            console.print(f"  [dim]Next check in {interval} minutes…[/dim]")
+            await asyncio.sleep(interval * 60)
+
+    try:
+        asyncio.run(_loop())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Monitor stopped.[/dim]\n")
+===== ./cli/scan.py =====
+"""
+cli/scan.py
+Batch scan multiple contracts at once.
+"""
+import asyncio
+import time
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
+from fetchers.etherscan import fetch_all, CHAINS
+from ai.client import OpenRouterClient, OpenRouterError
+from ai.prompt_builder import build_audit_prompt
+from report.renderer import render_scan_summary, render_error, render_warning
+from utils.cache import get_cached, set_cached
+from utils.validators import is_valid_address
+from utils.exporter import export_batch_report
+from core.config import validate_config
+
+console = Console()
+
+
+async def scan_command(
+    addresses: list[str],
+    chain:     str,
+    save:      bool,
+    config:    dict,
+):
+    """Batch audit multiple contracts."""
+
+    issues = validate_config(config)
+    for issue in issues:
+        if issue.startswith("❌"):
+            render_error(issue)
+            return
+        render_warning(issue)
+
+    if chain not in CHAINS:
+        render_error(f"Unknown chain '{chain}'.")
+        return
+
+    # Clean and validate addresses
+    clean_addrs = []
+    for addr in addresses:
+        addr = addr.strip()
+        if is_valid_address(addr):
+            clean_addrs.append(addr)
+        else:
+            render_warning(f"Skipping invalid address: {addr}")
+
+    if not clean_addrs:
+        render_error("No valid addresses provided.")
+        return
+
+    console.print(
+        f"\n[bold cyan]🔍 Batch Scan[/bold cyan] — "
+        f"{len(clean_addrs)} contracts on [cyan]{CHAINS[chain]['name']}[/cyan]\n"
+    )
+
+    or_client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = config["openrouter"]["max_tokens"],
+        temperature = config["openrouter"]["temperature"],
+    )
+
+    results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Auditing contracts...", total=len(clean_addrs))
+
+        for addr in clean_addrs:
+            progress.update(task, description=f"[cyan]{addr[:16]}...[/cyan]")
+
+            try:
+                # Fetch
+                contract = get_cached(addr, chain)
+                if not contract:
+                    contract = await fetch_all(
+                        address=addr,
+                        chain=chain,
+                        api_key=config["explorers"].get("etherscan", ""),
+                    )
+                    set_cached(addr, chain, contract)
+
+                # Audit (non-streaming for batch)
+                messages = build_audit_prompt(contract)
+                audit    = await or_client.complete(messages)
+
+                results.append({
+                    "address":  addr,
+                    "verified": contract.get("verified", False),
+                    "audit":    audit,
+                    "contract": contract,
+                })
+
+            except OpenRouterError as e:
+                results.append({
+                    "address": addr,
+                    "error":   str(e),
+                    "audit":   {"risk_score": 0, "recommendation": "ERROR"},
+                })
+            except Exception as e:
+                results.append({
+                    "address": addr,
+                    "error":   str(e),
+                    "audit":   {"risk_score": 0, "recommendation": "ERROR"},
+                })
+
+            progress.advance(task)
+            # Small delay between audits to respect rate limits
+            await asyncio.sleep(1)
+
+    # Render summary table
+    render_scan_summary(results)
+
+    if save:
+        path = export_batch_report(results)
+        console.print(f"\n[dim]📄 Batch report saved: {path}[/dim]\n")
+===== ./core/watchlist.py =====
+# core/watchlist.py
+"""
+Persistent watchlist manager.
+Stores watched contracts in ~/.dexai/watchlist.json
+"""
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+WATCHLIST_FILE = Path.home() / ".dexai" / "watchlist.json"
+
+
+def _load() -> dict:
+    if not WATCHLIST_FILE.exists():
+        return {"entries": {}}
+    try:
+        return json.loads(WATCHLIST_FILE.read_text())
+    except Exception:
+        return {"entries": {}}
+
+
+def _save(data: dict) -> None:
+    WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WATCHLIST_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _key(address: str, chain: str) -> str:
+    return f"{chain}_{address.lower()}"
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def add_entry(
+    address: str,
+    chain: str,
+    label: str = "",
+    alert_threshold: float = 6.0,
+) -> dict:
+    """Add a contract to the watchlist. Returns the entry."""
+    data = _load()
+    k    = _key(address, chain)
+    if k in data["entries"]:
+        return data["entries"][k]          # already exists
+
+    entry = {
+        "address":         address.lower(),
+        "chain":           chain,
+        "label":           label or address[:10] + "…",
+        "added":           datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        "last_checked":    None,
+        "last_risk_score": None,
+        "last_verdict":    None,
+        "alert_threshold": alert_threshold,
+        "active":          True,
+    }
+    data["entries"][k] = entry
+    _save(data)
+    return entry
+
+
+def remove_entry(address: str, chain: str) -> bool:
+    data = _load()
+    k    = _key(address, chain)
+    if k not in data["entries"]:
+        return False
+    del data["entries"][k]
+    _save(data)
+    return True
+
+
+def list_entries(active_only: bool = True) -> list[dict]:
+    data = _load()
+    entries = list(data["entries"].values())
+    if active_only:
+        entries = [e for e in entries if e.get("active", True)]
+    return sorted(entries, key=lambda x: x.get("chain", "") + x.get("address", ""))
+
+
+def update_entry(address: str, chain: str, **kwargs) -> None:
+    """Update fields on an existing entry (e.g. last_risk_score)."""
+    data = _load()
+    k    = _key(address, chain)
+    if k in data["entries"]:
+        data["entries"][k].update(kwargs)
+        _save(data)
+
+
+def get_entry(address: str, chain: str) -> dict | None:
+    data = _load()
+    return data["entries"].get(_key(address, chain))
+
+
+def count() -> int:
+    return len(_load()["entries"])
+===== ./core/monitor_session.py =====
+# core/monitor_session.py
+"""
+Portfolio monitor pipeline:
+  - Periodically re-audits all watched contracts
+  - Compares with last known state
+  - Fires alerts when risk score jumps or flags change
+"""
+import asyncio
+import json
+from datetime import datetime, timezone
+
+from ai.client import OpenRouterClient
+from ai.portfolio_prompt import build_monitor_prompt
+from core.session import run_audit
+from core.watchlist import list_entries, update_entry
+from utils.cache import get_cached
+
+
+async def check_one(
+    entry: dict,
+    config: dict,
+) -> dict:
+    """
+    Re-audit one watched contract and detect changes.
+    Returns a change-detection result dict.
+    """
+    address = entry["address"]
+    chain   = entry["chain"]
+    label   = entry["label"]
+    threshold = float(entry.get("alert_threshold", 6.0))
+
+    # Run fresh audit (bypasses cache with TTL=0)
+    try:
+        _, new_result = await run_audit(address, chain, config, stream=False)
+    except Exception as e:
+        return {
+            "address": address, "chain": chain, "label": label,
+            "alert": False, "error": str(e),
+        }
+
+    new_score = new_result.get("risk_score", 0.0)
+    old_score = entry.get("last_risk_score")
+    old_result_stub = {
+        "risk_score":      old_score,
+        "recommendation":  entry.get("last_verdict"),
+    }
+
+    # Update watchlist with current result
+    now = datetime.now(tz=timezone.utc).isoformat()
+    update_entry(
+        address, chain,
+        last_checked    = now,
+        last_risk_score = new_score,
+        last_verdict    = new_result.get("recommendation"),
+    )
+
+    # Simple threshold-based alert (no AI needed for every check)
+    score_jump  = (old_score is not None) and (new_score - old_score >= 2.0)
+    over_thresh = new_score >= threshold
+
+    if not (score_jump or over_thresh):
+        return {
+            "address": address, "chain": chain, "label": label,
+            "alert": False, "new_score": new_score, "old_score": old_score,
+            "alert_level": "NONE", "message": "No significant change",
+        }
+
+    # AI-powered change analysis for real alerts
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 600,
+        temperature = 0.1,
+    )
+    messages      = build_monitor_prompt(address, chain, label, old_result_stub, new_result)
+    change_result = await client.complete(messages)
+
+    return {
+        "address":    address,
+        "chain":      chain,
+        "label":      label,
+        "new_score":  new_score,
+        "old_score":  old_score,
+        **change_result,
+    }
+
+
+async def run_monitor_cycle(config: dict) -> list[dict]:
+    """
+    Run one full monitor cycle across all active watchlist entries.
+    Returns list of check results (only alerts by default).
+    """
+    entries = list_entries(active_only=True)
+    if not entries:
+        return []
+
+    # Stagger checks to stay within Etherscan rate limits
+    results = []
+    for entry in entries:
+        result = await check_one(entry, config)
+        results.append(result)
+        await asyncio.sleep(0.5)   # small gap between contracts
+
+    return results
+===== ./core/deployer_session.py =====
+# core/deployer_session.py
+"""
+Orchestrates the full deployer forensics pipeline:
+fetch → AI analysis → return result
+"""
+import json
+import asyncio
+from typing import AsyncGenerator
+
+from core.chains import CHAINS
+from fetchers.deployer import fetch_deployer_profile
+from ai.deployer_prompt import build_deployer_prompt
+from ai.client import OpenRouterClient
+from utils.validators import is_valid_address
+from utils.cache import get_cached, set_cached
+
+DEPLOYER_CACHE_KEY_PREFIX = "deployer_"
+
+
+async def run_deployer_analysis(
+    deployer: str,
+    config: dict,
+    chains: list[str] | None = None,
+    stream: bool = True,
+) -> tuple[dict, dict | AsyncGenerator]:
+    """
+    Full deployer forensics pipeline.
+
+    Returns: (profile_dict, ai_result_or_generator)
+    """
+    if not is_valid_address(deployer):
+        raise ValueError(f"Invalid wallet address: {deployer}")
+
+    api_key = config["explorers"].get("etherscan", "")
+    if not api_key:
+        raise ValueError(
+            "Etherscan API key required for deployer forensics.\n"
+            "Set it with: dexai config set explorers.etherscan YOUR_KEY"
+        )
+
+    chains_to_scan = chains or ["eth", "bsc", "polygon", "base", "arb"]
+
+    # Cache key includes chain list so different scans are cached separately
+    cache_key = f"{DEPLOYER_CACHE_KEY_PREFIX}{deployer.lower()}_{'_'.join(sorted(chains_to_scan))}"
+
+    cached = get_cached(deployer, cache_key)
+    if cached and cached.get("total_deployments") is not None:
+        profile = cached
+    else:
+        profile = await fetch_deployer_profile(
+            deployer, api_key,
+            chains_to_scan=chains_to_scan,
+            enrich=True,
+        )
+        set_cached(deployer, cache_key, profile)
+
+    messages = build_deployer_prompt(profile)
+
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = config["openrouter"]["max_tokens"],
+        temperature = 0.1,
+    )
+
+    if stream:
+        return profile, client.stream_audit(messages)
+    else:
+        result = await client.complete(messages)
+        return profile, result
+===== ./core/config.py =====
+# core/config.py
+import json
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.prompt import Prompt
+
+from ai.models import MODELS, DEFAULT_MODEL_KEY
+
+CONFIG_DIR   = Path.home() / ".dexai"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+LICENSE_FILE = CONFIG_DIR / "license.key"
+
+console = Console()
+
+DEFAULT_CONFIG: dict = {
+    "openrouter": {
+        "api_key":     "",
+        "model":       MODELS[DEFAULT_MODEL_KEY]["id"],
+        "model_key":   DEFAULT_MODEL_KEY,
+        "temperature": 0.1,
+        "max_tokens":  4000,
+    },
+    "explorers": {
+        "etherscan": "",
+    },
+    "preferences": {
+        "default_chain":  "eth",
+        "stream_output":  True,
+        "save_reports":   False,
+        "cache_ttl_secs": 3600,
+    },
+}
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return run_setup_wizard()
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        return _deep_merge(DEFAULT_CONFIG, data)
+    except (json.JSONDecodeError, OSError) as e:
+        console.print(f"[red]Config error: {e}[/red]")
+        sys.exit(1)
+
+
+def save_config(config: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def set_value(key: str, value: str) -> None:
+    config = load_config()
+    keys   = key.split(".")
+    target = config
+    for k in keys[:-1]:
+        if k not in target:
+            console.print(f"[red]Unknown key: {key}[/red]")
+            return
+        target = target[k]
+    final_key = keys[-1]
+    if final_key not in target:
+        console.print(f"[red]Unknown key: {key}[/red]")
+        return
+    existing = target[final_key]
+    if isinstance(existing, bool):
+        value = value.lower() in ("true", "1", "yes")
+    elif isinstance(existing, int):
+        value = int(value)
+    target[final_key] = value
+    save_config(config)
+    console.print(f"[green]✓ Set {key} = {value}[/green]")
+
+
+def validate_keys(config: dict) -> bool:
+    ok = True
+    if not config["openrouter"]["api_key"]:
+        console.print(
+            "[red]✗ OpenRouter API key missing.[/red]\n"
+            "  Run: [bold]dexai config set openrouter.api_key YOUR_KEY[/bold]"
+        )
+        ok = False
+    if not config["explorers"]["etherscan"]:
+        console.print(
+            "[yellow]⚠ No Etherscan key — limited data available.[/yellow]"
+        )
+    return ok
+
+
+def run_setup_wizard() -> dict:
+    config = _deep_merge(DEFAULT_CONFIG, {})
+
+    console.print("\n[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+    console.print("[bold cyan]  DexAI — First Time Setup[/bold cyan]")
+    console.print("[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]\n")
+
+    console.print("[bold]Step 1/3 — OpenRouter API Key[/bold]")
+    console.print("  Get one free at openrouter.ai\n")
+    or_key = Prompt.ask("  Enter your OpenRouter API key", password=True)
+    config["openrouter"]["api_key"] = or_key.strip()
+
+    console.print("\n[bold]Step 2/3 — Default AI Model[/bold]\n")
+    for i, (k, m) in enumerate(MODELS.items(), 1):
+        cost = "FREE" if m["cost_in"] == 0 else f"${m['cost_in']:.2f}/${m['cost_out']:.2f}/1M tok"
+        console.print(f"  [cyan]{i}[/cyan]. [bold]{m['label']}[/bold]  [dim]{cost}[/dim]")
+        console.print(f"     {m['note']}")
+    console.print()
+
+    model_keys = list(MODELS.keys())
+    choice = Prompt.ask("  Choose model [1-4]", choices=["1","2","3","4"], default="2")
+    chosen_key = model_keys[int(choice) - 1]
+    config["openrouter"]["model"]     = MODELS[chosen_key]["id"]
+    config["openrouter"]["model_key"] = chosen_key
+    console.print(f"\n  [green]✓ {MODELS[chosen_key]['label']} selected[/green]")
+
+    console.print("\n[bold]Step 3/3 — Etherscan V2 API Key[/bold]")
+    console.print("  One key = ETH + BSC + Polygon + Base + Arb + 50 more chains")
+    console.print("  Get one free at etherscan.io/apis\n")
+    eth_key = Prompt.ask("  Enter Etherscan key (Enter to skip)", default="")
+    if eth_key.strip():
+        config["explorers"]["etherscan"] = eth_key.strip()
+        console.print("  [green]✓ Saved[/green]")
+    else:
+        console.print("  [yellow]⚠ Skipped[/yellow]")
+
+    save_config(config)
+    console.print(f"\n[green bold]✓ Config saved → {CONFIG_FILE}[/green bold]\n")
+    return config
+===== ./core/core/wallet_session.py =====
+# core/wallet_session.py
+"""
+Wallet tracker pipeline:
+  1. Fetch all token holdings for a wallet
+  2. Audit each contract (batch, non-streaming, capped at 10)
+  3. Run portfolio risk AI analysis
+  4. Return complete picture
+"""
+import asyncio
+from ai.client import OpenRouterClient
+from ai.portfolio_prompt import build_portfolio_prompt
+from core.chains import get_chain
+from core.session import run_audit
+from fetchers.wallet import fetch_wallet_holdings
+from utils.validators import is_valid_address
+
+
+MAX_AUDIT_TOKENS = 10      # Audit up to 10 tokens to stay within rate limits
+
+
+async def run_wallet_tracker(
+    wallet: str,
+    chain_name: str,
+    config: dict,
+) -> dict:
+    """
+    Full wallet tracker pipeline.
+    Returns:
+    {
+      "wallet_snapshot": {...},        # holdings from Etherscan
+      "audited_holdings": [...],       # each holding + its audit result
+      "portfolio_analysis": {...},     # AI portfolio risk assessment
+      "skipped_count": int,            # tokens not audited (>MAX_AUDIT_TOKENS)
+    }
+    """
+    if not is_valid_address(wallet):
+        raise ValueError(f"Invalid wallet address: {wallet}")
+
+    chain    = get_chain(chain_name)
+    api_key  = config["explorers"].get("etherscan", "")
+
+    # 1. Fetch holdings
+    snapshot = await fetch_wallet_holdings(
+        wallet, chain["id"], chain["key"], api_key
+    )
+
+    holdings  = snapshot.get("holdings", [])
+    to_audit  = holdings[:MAX_AUDIT_TOKENS]
+    skipped   = len(holdings) - len(to_audit)
+
+    # 2. Audit each token contract concurrently (non-streaming)
+    audit_tasks = [
+        run_audit(h["contract_address"], chain["key"], config, stream=False)
+        for h in to_audit
+    ]
+    audit_results = await asyncio.gather(*audit_tasks, return_exceptions=True)
+
+    audited = []
+    for holding, result in zip(to_audit, audit_results):
+        if isinstance(result, Exception):
+            audit_data = {"risk_score": 5.0, "recommendation": "UNKNOWN",
+                         "error": str(result)}
+        else:
+            _, audit_data = result
+        audited.append({**holding, "audit": audit_data})
+
+    # 3. Portfolio risk AI analysis
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 1500,
+        temperature = 0.1,
+    )
+    messages         = build_portfolio_prompt(wallet, chain["key"], audited)
+    portfolio_result = await client.complete(messages)
+
+    return {
+        "wallet_snapshot":    snapshot,
+        "audited_holdings":   audited,
+        "portfolio_analysis": portfolio_result,
+        "skipped_count":      skipped,
+    }
+===== ./core/core/watchlist.py =====
+# core/watchlist.py
+"""
+Persistent watchlist manager.
+Stores watched contracts in ~/.dexai/watchlist.json
+"""
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+WATCHLIST_FILE = Path.home() / ".dexai" / "watchlist.json"
+
+
+def _load() -> dict:
+    if not WATCHLIST_FILE.exists():
+        return {"entries": {}}
+    try:
+        return json.loads(WATCHLIST_FILE.read_text())
+    except Exception:
+        return {"entries": {}}
+
+
+def _save(data: dict) -> None:
+    WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WATCHLIST_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _key(address: str, chain: str) -> str:
+    return f"{chain}_{address.lower()}"
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def add_entry(
+    address: str,
+    chain: str,
+    label: str = "",
+    alert_threshold: float = 6.0,
+) -> dict:
+    """Add a contract to the watchlist. Returns the entry."""
+    data = _load()
+    k    = _key(address, chain)
+    if k in data["entries"]:
+        return data["entries"][k]          # already exists
+
+    entry = {
+        "address":         address.lower(),
+        "chain":           chain,
+        "label":           label or address[:10] + "…",
+        "added":           datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        "last_checked":    None,
+        "last_risk_score": None,
+        "last_verdict":    None,
+        "alert_threshold": alert_threshold,
+        "active":          True,
+    }
+    data["entries"][k] = entry
+    _save(data)
+    return entry
+
+
+def remove_entry(address: str, chain: str) -> bool:
+    data = _load()
+    k    = _key(address, chain)
+    if k not in data["entries"]:
+        return False
+    del data["entries"][k]
+    _save(data)
+    return True
+
+
+def list_entries(active_only: bool = True) -> list[dict]:
+    data = _load()
+    entries = list(data["entries"].values())
+    if active_only:
+        entries = [e for e in entries if e.get("active", True)]
+    return sorted(entries, key=lambda x: x.get("chain", "") + x.get("address", ""))
+
+
+def update_entry(address: str, chain: str, **kwargs) -> None:
+    """Update fields on an existing entry (e.g. last_risk_score)."""
+    data = _load()
+    k    = _key(address, chain)
+    if k in data["entries"]:
+        data["entries"][k].update(kwargs)
+        _save(data)
+
+
+def get_entry(address: str, chain: str) -> dict | None:
+    data = _load()
+    return data["entries"].get(_key(address, chain))
+
+
+def count() -> int:
+    return len(_load()["entries"])
+===== ./core/core/__init__.py =====
+===== ./core/core/license.py =====
+# core/license.py
+"""
+Offline Ed25519 license system.
+
+Flow:
+  Seller side:  generate_keypair() once → keep private key secret
+                sign_license(device_id, private_key) → license key string
+                send license key to buyer via email
+
+  Buyer side:   dexai activate <LICENSE_KEY>
+                validate_license(license_key) → True/False
+                stored in ~/.dexai/license.key
+                checked on every startup — never needs internet
+"""
+import os
+import sys
+import base64
+import hashlib
+import socket
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PublicFormat, PrivateFormat, NoEncryption,
+    load_pem_private_key, load_pem_public_key,
+)
+from cryptography.exceptions import InvalidSignature
+from rich.console import Console
+
+console = Console()
+
+LICENSE_FILE = Path.home() / ".dexai" / "license.key"
+
+# ── PUBLIC KEY BAKED INTO BINARY ─────────────────────────────────────────────
+# Generated once with generate_keypair() — replace with your real key before
+# distributing.  The private key NEVER goes in this file.
+BAKED_PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAREPLACETHISWITHYOURREALPUBLICKEY00000000000000=
+-----END PUBLIC KEY-----"""
+
+
+# ── Device Fingerprint ────────────────────────────────────────────────────────
+
+def get_device_id() -> str:
+    """
+    Stable device fingerprint from hostname + username.
+    Consistent across reboots on the same device.
+    Returns a 16-char hex string.
+    """
+    hostname = socket.gethostname()
+    username = os.environ.get("USER", os.environ.get("USERNAME", "user"))
+    raw = f"{hostname}::{username}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ── Seller Tools (run offline on your machine) ────────────────────────────────
+
+def generate_keypair() -> tuple[str, str]:
+    """
+    Generate a fresh Ed25519 key pair.
+    Run this ONCE — store the private key securely (never share it).
+    Paste the public key into BAKED_PUBLIC_KEY_PEM above before building.
+
+    Returns: (private_key_pem_str, public_key_pem_str)
+    """
+    private_key = Ed25519PrivateKey.generate()
+    priv_pem = private_key.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+    ).decode()
+    pub_pem = private_key.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+    return priv_pem, pub_pem
+
+
+def sign_license(device_id: str, private_key_pem: str) -> str:
+    """
+    Sign a device_id with your private key.
+    Returns a base64 license key string to send to the buyer.
+
+    Usage (seller script):
+        priv, pub = generate_keypair()  # once
+        device_id = <from buyer's activation request>
+        license_key = sign_license(device_id, priv)
+        # email license_key to buyer
+    """
+    private_key = load_pem_private_key(private_key_pem.encode(), password=None)
+    signature   = private_key.sign(device_id.encode())
+    return base64.urlsafe_b64encode(signature).decode()
+
+
+# ── Buyer-Side Validation ─────────────────────────────────────────────────────
+
+def validate_license(license_key: str) -> bool:
+    """
+    Verify the license key against this device's fingerprint.
+    Uses the public key baked into the binary — fully offline.
+    """
+    # Dev/test bypass — set DEXAI_DEV=1 to skip license check
+    if os.environ.get("DEXAI_DEV") == "1":
+        return True
+
+    try:
+        pub_key   = load_pem_public_key(BAKED_PUBLIC_KEY_PEM)
+        device_id = get_device_id()
+        signature = base64.urlsafe_b64decode(license_key.encode())
+        pub_key.verify(signature, device_id.encode())
+        return True
+    except (InvalidSignature, Exception):
+        return False
+
+
+def load_license() -> str | None:
+    """Read stored license key from disk."""
+    if LICENSE_FILE.exists():
+        return LICENSE_FILE.read_text().strip()
+    return None
+
+
+def save_license(license_key: str) -> None:
+    """Persist license key to disk."""
+    LICENSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LICENSE_FILE.write_text(license_key.strip())
+
+
+def activate(license_key: str) -> bool:
+    """
+    Validate and store a license key.
+    Called by: dexai activate <KEY>
+    """
+    if validate_license(license_key):
+        save_license(license_key)
+        return True
+    return False
+
+
+def check_license_on_startup() -> None:
+    """
+    Called at the start of every command.
+    Exits with a clear message if license is invalid or missing.
+    """
+    if os.environ.get("DEXAI_DEV") == "1":
+        return  # Dev mode — skip check
+
+    license_key = load_license()
+    if not license_key:
+        console.print(
+            "\n[bold red]✗ No license found.[/bold red]\n\n"
+            "  Purchase DexAI at: [link=https://whop.com/dexai]whop.com/dexai[/link]\n\n"
+            "  After purchase, activate with:\n"
+            "    [bold]dexai activate YOUR_LICENSE_KEY[/bold]\n\n"
+            f"  Your device ID: [bold cyan]{get_device_id()}[/bold cyan]\n"
+            "  (Include this when contacting support)\n"
+        )
+        sys.exit(1)
+
+    if not validate_license(license_key):
+        console.print(
+            "\n[bold red]✗ Invalid license.[/bold red]\n\n"
+            "  This license key does not match this device.\n"
+            "  Each purchase is tied to one device.\n\n"
+            "  Need help? Contact: support@dexai.app\n"
+            f"  Device ID: [bold cyan]{get_device_id()}[/bold cyan]\n"
+        )
+        sys.exit(1)
+===== ./core/core/monitor_session.py =====
+# core/monitor_session.py
+"""
+Portfolio monitor pipeline:
+  - Periodically re-audits all watched contracts
+  - Compares with last known state
+  - Fires alerts when risk score jumps or flags change
+"""
+import asyncio
+import json
+from datetime import datetime, timezone
+
+from ai.client import OpenRouterClient
+from ai.portfolio_prompt import build_monitor_prompt
+from core.session import run_audit
+from core.watchlist import list_entries, update_entry
+from utils.cache import get_cached
+
+
+async def check_one(
+    entry: dict,
+    config: dict,
+) -> dict:
+    """
+    Re-audit one watched contract and detect changes.
+    Returns a change-detection result dict.
+    """
+    address = entry["address"]
+    chain   = entry["chain"]
+    label   = entry["label"]
+    threshold = float(entry.get("alert_threshold", 6.0))
+
+    # Run fresh audit (bypasses cache with TTL=0)
+    try:
+        _, new_result = await run_audit(address, chain, config, stream=False)
+    except Exception as e:
+        return {
+            "address": address, "chain": chain, "label": label,
+            "alert": False, "error": str(e),
+        }
+
+    new_score = new_result.get("risk_score", 0.0)
+    old_score = entry.get("last_risk_score")
+    old_result_stub = {
+        "risk_score":      old_score,
+        "recommendation":  entry.get("last_verdict"),
+    }
+
+    # Update watchlist with current result
+    now = datetime.now(tz=timezone.utc).isoformat()
+    update_entry(
+        address, chain,
+        last_checked    = now,
+        last_risk_score = new_score,
+        last_verdict    = new_result.get("recommendation"),
+    )
+
+    # Simple threshold-based alert (no AI needed for every check)
+    score_jump  = (old_score is not None) and (new_score - old_score >= 2.0)
+    over_thresh = new_score >= threshold
+
+    if not (score_jump or over_thresh):
+        return {
+            "address": address, "chain": chain, "label": label,
+            "alert": False, "new_score": new_score, "old_score": old_score,
+            "alert_level": "NONE", "message": "No significant change",
+        }
+
+    # AI-powered change analysis for real alerts
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 600,
+        temperature = 0.1,
+    )
+    messages      = build_monitor_prompt(address, chain, label, old_result_stub, new_result)
+    change_result = await client.complete(messages)
+
+    return {
+        "address":    address,
+        "chain":      chain,
+        "label":      label,
+        "new_score":  new_score,
+        "old_score":  old_score,
+        **change_result,
+    }
+
+
+async def run_monitor_cycle(config: dict) -> list[dict]:
+    """
+    Run one full monitor cycle across all active watchlist entries.
+    Returns list of check results (only alerts by default).
+    """
+    entries = list_entries(active_only=True)
+    if not entries:
+        return []
+
+    # Stagger checks to stay within Etherscan rate limits
+    results = []
+    for entry in entries:
+        result = await check_one(entry, config)
+        results.append(result)
+        await asyncio.sleep(0.5)   # small gap between contracts
+
+    return results
+===== ./core/core/chains.py =====
+# core/chains.py
+# Etherscan V2 — single API key covers all chains
+
+CHAINS = {
+    "eth":     {"id": 1,      "name": "Ethereum",       "symbol": "ETH"},
+    "bsc":     {"id": 56,     "name": "BNB Smart Chain", "symbol": "BNB"},
+    "polygon": {"id": 137,    "name": "Polygon",         "symbol": "MATIC"},
+    "arb":     {"id": 42161,  "name": "Arbitrum One",    "symbol": "ETH"},
+    "base":    {"id": 8453,   "name": "Base",            "symbol": "ETH"},
+    "op":      {"id": 10,     "name": "Optimism",        "symbol": "ETH"},
+    "avax":    {"id": 43114,  "name": "Avalanche",       "symbol": "AVAX"},
+    "fantom":  {"id": 250,    "name": "Fantom",          "symbol": "FTM"},
+    "zksync":  {"id": 324,    "name": "zkSync Era",      "symbol": "ETH"},
+    "gnosis":  {"id": 100,    "name": "Gnosis",          "symbol": "xDAI"},
+}
+
+CHAIN_ALIASES = {
+    "ethereum": "eth",
+    "bnb":      "bsc",
+    "binance":  "bsc",
+    "matic":    "polygon",
+    "arbitrum": "arb",
+    "optimism": "op",
+    "avalanche":"avax",
+    "ftm":      "fantom",
+}
+
+ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
+
+
+def resolve_chain(name: str) -> str:
+    """Normalise any chain name/alias to the canonical key."""
+    key = name.lower().strip()
+    return CHAIN_ALIASES.get(key, key)
+
+
+def get_chain(name: str) -> dict:
+    key = resolve_chain(name)
+    if key not in CHAINS:
+        supported = ", ".join(CHAINS.keys())
+        raise ValueError(f"Unsupported chain '{name}'. Supported: {supported}")
+    return {"key": key, **CHAINS[key]}
+===== ./core/core/session.py =====
+# core/session.py
+import asyncio
+import json
+from typing import AsyncGenerator
+
+from core.chains import get_chain
+from fetchers.etherscan import fetch_all
+from ai.client import OpenRouterClient
+from ai.prompt_builder import build_audit_prompt, build_qa_prompt
+from utils.cache import get_cached, set_cached
+from utils.validators import is_valid_address
+
+
+async def run_audit(
+    address: str,
+    chain_name: str,
+    config: dict,
+    stream: bool = True,
+) -> dict | AsyncGenerator:
+    if not is_valid_address(address):
+        raise ValueError(f"Invalid address: {address}")
+
+    chain   = get_chain(chain_name)
+    api_key = config["explorers"].get("etherscan", "")
+
+    cached = get_cached(address, chain["key"])
+    if cached and cached.get("verified"):
+        contract = cached
+    else:
+        contract = await fetch_all(address, chain["id"], api_key)
+        contract["address"]  = address
+        contract["chain"]    = chain["key"]
+        contract["chain_id"] = chain["id"]
+        set_cached(address, chain["key"], contract)
+
+    messages = build_audit_prompt(contract)
+
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = config["openrouter"]["max_tokens"],
+        temperature = config["openrouter"]["temperature"],
+    )
+
+    if stream:
+        return contract, client.stream_audit(messages)
+    else:
+        result = await client.complete(messages)
+        return contract, result
+
+
+async def run_qa(
+    address: str,
+    chain_name: str,
+    config: dict,
+    history: list[dict],
+    question: str,
+    audit_result: dict = None,          # <-- new parameter
+) -> AsyncGenerator:
+    chain    = get_chain(chain_name)
+    contract = get_cached(address, chain["key"]) or {}
+    contract.setdefault("address",  address)
+    contract.setdefault("chain",    chain["key"])
+    contract.setdefault("chain_id", chain["id"])
+
+    messages = build_qa_prompt(contract, history, question, audit_result=audit_result)
+    client   = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 1000,
+        temperature = 0.3,
+    )
+    return client.stream_audit(messages)
+===== ./core/core/deployer_session.py =====
+# core/deployer_session.py
+"""
+Orchestrates the full deployer forensics pipeline:
+fetch → AI analysis → return result
+"""
+import json
+import asyncio
+from typing import AsyncGenerator
+
+from core.chains import CHAINS
+from fetchers.deployer import fetch_deployer_profile
+from ai.deployer_prompt import build_deployer_prompt
+from ai.client import OpenRouterClient
+from utils.validators import is_valid_address
+from utils.cache import get_cached, set_cached
+
+DEPLOYER_CACHE_KEY_PREFIX = "deployer_"
+
+
+async def run_deployer_analysis(
+    deployer: str,
+    config: dict,
+    chains: list[str] | None = None,
+    stream: bool = True,
+) -> tuple[dict, dict | AsyncGenerator]:
+    """
+    Full deployer forensics pipeline.
+
+    Returns: (profile_dict, ai_result_or_generator)
+    """
+    if not is_valid_address(deployer):
+        raise ValueError(f"Invalid wallet address: {deployer}")
+
+    api_key = config["explorers"].get("etherscan", "")
+    if not api_key:
+        raise ValueError(
+            "Etherscan API key required for deployer forensics.\n"
+            "Set it with: dexai config set explorers.etherscan YOUR_KEY"
+        )
+
+    chains_to_scan = chains or ["eth", "bsc", "polygon", "base", "arb"]
+
+    # Cache key includes chain list so different scans are cached separately
+    cache_key = f"{DEPLOYER_CACHE_KEY_PREFIX}{deployer.lower()}_{'_'.join(sorted(chains_to_scan))}"
+
+    cached = get_cached(deployer, cache_key)
+    if cached and cached.get("total_deployments") is not None:
+        profile = cached
+    else:
+        profile = await fetch_deployer_profile(
+            deployer, api_key,
+            chains_to_scan=chains_to_scan,
+            enrich=True,
+        )
+        set_cached(deployer, cache_key, profile)
+
+    messages = build_deployer_prompt(profile)
+
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = config["openrouter"]["max_tokens"],
+        temperature = 0.1,
+    )
+
+    if stream:
+        return profile, client.stream_audit(messages)
+    else:
+        result = await client.complete(messages)
+        return profile, result
+===== ./core/core/config.py =====
+# core/config.py
+import json
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.prompt import Prompt
+
+from ai.models import MODELS, DEFAULT_MODEL_KEY
+
+CONFIG_DIR   = Path.home() / ".dexai"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+LICENSE_FILE = CONFIG_DIR / "license.key"
+
+console = Console()
+
+DEFAULT_CONFIG: dict = {
+    "openrouter": {
+        "api_key":     "",
+        "model":       MODELS[DEFAULT_MODEL_KEY]["id"],
+        "model_key":   DEFAULT_MODEL_KEY,
+        "temperature": 0.1,
+        "max_tokens":  4000,
+    },
+    "explorers": {
+        "etherscan": "",
+    },
+    "preferences": {
+        "default_chain":  "eth",
+        "stream_output":  True,
+        "save_reports":   False,
+        "cache_ttl_secs": 3600,
+    },
+}
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return run_setup_wizard()
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        return _deep_merge(DEFAULT_CONFIG, data)
+    except (json.JSONDecodeError, OSError) as e:
+        console.print(f"[red]Config error: {e}[/red]")
+        sys.exit(1)
+
+
+def save_config(config: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def set_value(key: str, value: str) -> None:
+    config = load_config()
+    keys   = key.split(".")
+    target = config
+    for k in keys[:-1]:
+        if k not in target:
+            console.print(f"[red]Unknown key: {key}[/red]")
+            return
+        target = target[k]
+    final_key = keys[-1]
+    if final_key not in target:
+        console.print(f"[red]Unknown key: {key}[/red]")
+        return
+    existing = target[final_key]
+    if isinstance(existing, bool):
+        value = value.lower() in ("true", "1", "yes")
+    elif isinstance(existing, int):
+        value = int(value)
+    target[final_key] = value
+    save_config(config)
+    console.print(f"[green]✓ Set {key} = {value}[/green]")
+
+
+def validate_keys(config: dict) -> bool:
+    ok = True
+    if not config["openrouter"]["api_key"]:
+        console.print(
+            "[red]✗ OpenRouter API key missing.[/red]\n"
+            "  Run: [bold]dexai config set openrouter.api_key YOUR_KEY[/bold]"
+        )
+        ok = False
+    if not config["explorers"]["etherscan"]:
+        console.print(
+            "[yellow]⚠ No Etherscan key — limited data available.[/yellow]"
+        )
+    return ok
+
+
+def run_setup_wizard() -> dict:
+    config = _deep_merge(DEFAULT_CONFIG, {})
+
+    console.print("\n[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+    console.print("[bold cyan]  DexAI — First Time Setup[/bold cyan]")
+    console.print("[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]\n")
+
+    console.print("[bold]Step 1/3 — OpenRouter API Key[/bold]")
+    console.print("  Get one free at openrouter.ai\n")
+    or_key = Prompt.ask("  Enter your OpenRouter API key", password=True)
+    config["openrouter"]["api_key"] = or_key.strip()
+
+    console.print("\n[bold]Step 2/3 — Default AI Model[/bold]\n")
+    for i, (k, m) in enumerate(MODELS.items(), 1):
+        cost = "FREE" if m["cost_in"] == 0 else f"${m['cost_in']:.2f}/${m['cost_out']:.2f}/1M tok"
+        console.print(f"  [cyan]{i}[/cyan]. [bold]{m['label']}[/bold]  [dim]{cost}[/dim]")
+        console.print(f"     {m['note']}")
+    console.print()
+
+    model_keys = list(MODELS.keys())
+    choice = Prompt.ask("  Choose model [1-4]", choices=["1","2","3","4"], default="2")
+    chosen_key = model_keys[int(choice) - 1]
+    config["openrouter"]["model"]     = MODELS[chosen_key]["id"]
+    config["openrouter"]["model_key"] = chosen_key
+    console.print(f"\n  [green]✓ {MODELS[chosen_key]['label']} selected[/green]")
+
+    console.print("\n[bold]Step 3/3 — Etherscan V2 API Key[/bold]")
+    console.print("  One key = ETH + BSC + Polygon + Base + Arb + 50 more chains")
+    console.print("  Get one free at etherscan.io/apis\n")
+    eth_key = Prompt.ask("  Enter Etherscan key (Enter to skip)", default="")
+    if eth_key.strip():
+        config["explorers"]["etherscan"] = eth_key.strip()
+        console.print("  [green]✓ Saved[/green]")
+    else:
+        console.print("  [yellow]⚠ Skipped[/yellow]")
+
+    save_config(config)
+    console.print(f"\n[green bold]✓ Config saved → {CONFIG_FILE}[/green bold]\n")
+    return config
+===== ./core/session.py =====
+# core/session.py
+import asyncio
+import json
+from typing import AsyncGenerator
+
+from core.chains import get_chain
+from fetchers.etherscan import fetch_all
+from ai.client import OpenRouterClient
+from ai.prompt_builder import build_audit_prompt, build_qa_prompt
+from utils.cache import get_cached, set_cached
+from utils.validators import is_valid_address
+
+
+async def run_audit(
+    address: str,
+    chain_name: str,
+    config: dict,
+    stream: bool = True,
+) -> dict | AsyncGenerator:
+    if not is_valid_address(address):
+        raise ValueError(f"Invalid address: {address}")
+
+    chain   = get_chain(chain_name)
+    api_key = config["explorers"].get("etherscan", "")
+
+    cached = get_cached(address, chain["key"])
+    if cached and cached.get("verified"):
+        contract = cached
+    else:
+        contract = await fetch_all(address, chain["id"], api_key)
+        contract["address"]  = address
+        contract["chain"]    = chain["key"]
+        contract["chain_id"] = chain["id"]
+        set_cached(address, chain["key"], contract)
+
+    messages = build_audit_prompt(contract)
+
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = config["openrouter"]["max_tokens"],
+        temperature = config["openrouter"]["temperature"],
+    )
+
+    if stream:
+        return contract, client.stream_audit(messages)
+    else:
+        result = await client.complete(messages)
+        return contract, result
+
+
+async def run_qa(
+    address: str,
+    chain_name: str,
+    config: dict,
+    history: list[dict],
+    question: str,
+    audit_result: dict = None,          # <-- new parameter
+) -> AsyncGenerator:
+    chain    = get_chain(chain_name)
+    contract = get_cached(address, chain["key"]) or {}
+    contract.setdefault("address",  address)
+    contract.setdefault("chain",    chain["key"])
+    contract.setdefault("chain_id", chain["id"])
+
+    messages = build_qa_prompt(contract, history, question, audit_result=audit_result)
+    client   = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 1000,
+        temperature = 0.3,
+    )
+    return client.stream_audit(messages)
+===== ./core/license.py =====
+# core/license.py
+"""
+Offline Ed25519 license system.
+
+Flow:
+  Seller side:  generate_keypair() once → keep private key secret
+                sign_license(device_id, private_key) → license key string
+                send license key to buyer via email
+
+  Buyer side:   dexai activate <LICENSE_KEY>
+                validate_license(license_key) → True/False
+                stored in ~/.dexai/license.key
+                checked on every startup — never needs internet
+"""
+import os
+import sys
+import base64
+import hashlib
+import socket
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, PublicFormat, PrivateFormat, NoEncryption,
+    load_pem_private_key, load_pem_public_key,
+)
+from cryptography.exceptions import InvalidSignature
+from rich.console import Console
+
+console = Console()
+
+LICENSE_FILE = Path.home() / ".dexai" / "license.key"
+
+# ── PUBLIC KEY BAKED INTO BINARY ─────────────────────────────────────────────
+# Generated once with generate_keypair() — replace with your real key before
+# distributing.  The private key NEVER goes in this file.
+BAKED_PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAREPLACETHISWITHYOURREALPUBLICKEY00000000000000=
+-----END PUBLIC KEY-----"""
+
+
+# ── Device Fingerprint ────────────────────────────────────────────────────────
+
+def get_device_id() -> str:
+    """
+    Stable device fingerprint from hostname + username.
+    Consistent across reboots on the same device.
+    Returns a 16-char hex string.
+    """
+    hostname = socket.gethostname()
+    username = os.environ.get("USER", os.environ.get("USERNAME", "user"))
+    raw = f"{hostname}::{username}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ── Seller Tools (run offline on your machine) ────────────────────────────────
+
+def generate_keypair() -> tuple[str, str]:
+    """
+    Generate a fresh Ed25519 key pair.
+    Run this ONCE — store the private key securely (never share it).
+    Paste the public key into BAKED_PUBLIC_KEY_PEM above before building.
+
+    Returns: (private_key_pem_str, public_key_pem_str)
+    """
+    private_key = Ed25519PrivateKey.generate()
+    priv_pem = private_key.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+    ).decode()
+    pub_pem = private_key.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+    return priv_pem, pub_pem
+
+
+def sign_license(device_id: str, private_key_pem: str) -> str:
+    """
+    Sign a device_id with your private key.
+    Returns a base64 license key string to send to the buyer.
+
+    Usage (seller script):
+        priv, pub = generate_keypair()  # once
+        device_id = <from buyer's activation request>
+        license_key = sign_license(device_id, priv)
+        # email license_key to buyer
+    """
+    private_key = load_pem_private_key(private_key_pem.encode(), password=None)
+    signature   = private_key.sign(device_id.encode())
+    return base64.urlsafe_b64encode(signature).decode()
+
+
+# ── Buyer-Side Validation ─────────────────────────────────────────────────────
+
+def validate_license(license_key: str) -> bool:
+    """
+    Verify the license key against this device's fingerprint.
+    Uses the public key baked into the binary — fully offline.
+    """
+    # Dev/test bypass — set DEXAI_DEV=1 to skip license check
+    if os.environ.get("DEXAI_DEV") == "1":
+        return True
+
+    try:
+        pub_key   = load_pem_public_key(BAKED_PUBLIC_KEY_PEM)
+        device_id = get_device_id()
+        signature = base64.urlsafe_b64decode(license_key.encode())
+        pub_key.verify(signature, device_id.encode())
+        return True
+    except (InvalidSignature, Exception):
+        return False
+
+
+def load_license() -> str | None:
+    """Read stored license key from disk."""
+    if LICENSE_FILE.exists():
+        return LICENSE_FILE.read_text().strip()
+    return None
+
+
+def save_license(license_key: str) -> None:
+    """Persist license key to disk."""
+    LICENSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LICENSE_FILE.write_text(license_key.strip())
+
+
+def activate(license_key: str) -> bool:
+    """
+    Validate and store a license key.
+    Called by: dexai activate <KEY>
+    """
+    if validate_license(license_key):
+        save_license(license_key)
+        return True
+    return False
+
+
+def check_license_on_startup() -> None:
+    """
+    Called at the start of every command.
+    Exits with a clear message if license is invalid or missing.
+    """
+    if os.environ.get("DEXAI_DEV") == "1":
+        return  # Dev mode — skip check
+
+    license_key = load_license()
+    if not license_key:
+        console.print(
+            "\n[bold red]✗ No license found.[/bold red]\n\n"
+            "  Purchase DexAI at: [link=https://whop.com/dexai]whop.com/dexai[/link]\n\n"
+            "  After purchase, activate with:\n"
+            "    [bold]dexai activate YOUR_LICENSE_KEY[/bold]\n\n"
+            f"  Your device ID: [bold cyan]{get_device_id()}[/bold cyan]\n"
+            "  (Include this when contacting support)\n"
+        )
+        sys.exit(1)
+
+    if not validate_license(license_key):
+        console.print(
+            "\n[bold red]✗ Invalid license.[/bold red]\n\n"
+            "  This license key does not match this device.\n"
+            "  Each purchase is tied to one device.\n\n"
+            "  Need help? Contact: support@dexai.app\n"
+            f"  Device ID: [bold cyan]{get_device_id()}[/bold cyan]\n"
+        )
+        sys.exit(1)
+===== ./core/chains.py =====
+# core/chains.py
+# Etherscan V2 — single API key covers all chains
+
+CHAINS = {
+    "eth":     {"id": 1,      "name": "Ethereum",       "symbol": "ETH"},
+    "bsc":     {"id": 56,     "name": "BNB Smart Chain", "symbol": "BNB"},
+    "polygon": {"id": 137,    "name": "Polygon",         "symbol": "MATIC"},
+    "arb":     {"id": 42161,  "name": "Arbitrum One",    "symbol": "ETH"},
+    "base":    {"id": 8453,   "name": "Base",            "symbol": "ETH"},
+    "op":      {"id": 10,     "name": "Optimism",        "symbol": "ETH"},
+    "avax":    {"id": 43114,  "name": "Avalanche",       "symbol": "AVAX"},
+    "fantom":  {"id": 250,    "name": "Fantom",          "symbol": "FTM"},
+    "zksync":  {"id": 324,    "name": "zkSync Era",      "symbol": "ETH"},
+    "gnosis":  {"id": 100,    "name": "Gnosis",          "symbol": "xDAI"},
+}
+
+CHAIN_ALIASES = {
+    "ethereum": "eth",
+    "bnb":      "bsc",
+    "binance":  "bsc",
+    "matic":    "polygon",
+    "arbitrum": "arb",
+    "optimism": "op",
+    "avalanche":"avax",
+    "ftm":      "fantom",
+}
+
+ETHERSCAN_BASE = "https://api.etherscan.io/v2/api"
+
+
+def resolve_chain(name: str) -> str:
+    """Normalise any chain name/alias to the canonical key."""
+    key = name.lower().strip()
+    return CHAIN_ALIASES.get(key, key)
+
+
+def get_chain(name: str) -> dict:
+    key = resolve_chain(name)
+    if key not in CHAINS:
+        supported = ", ".join(CHAINS.keys())
+        raise ValueError(f"Unsupported chain '{name}'. Supported: {supported}")
+    return {"key": key, **CHAINS[key]}
+===== ./core/__init__.py =====
+===== ./core/wallet_session.py =====
+# core/wallet_session.py
+"""
+Wallet tracker pipeline:
+  1. Fetch all token holdings for a wallet
+  2. Audit each contract (batch, non-streaming, capped at 10)
+  3. Run portfolio risk AI analysis
+  4. Return complete picture
+"""
+import asyncio
+from ai.client import OpenRouterClient
+from ai.portfolio_prompt import build_portfolio_prompt
+from core.chains import get_chain
+from core.session import run_audit
+from fetchers.wallet import fetch_wallet_holdings
+from utils.validators import is_valid_address
+
+
+MAX_AUDIT_TOKENS = 10      # Audit up to 10 tokens to stay within rate limits
+
+
+async def run_wallet_tracker(
+    wallet: str,
+    chain_name: str,
+    config: dict,
+) -> dict:
+    """
+    Full wallet tracker pipeline.
+    Returns:
+    {
+      "wallet_snapshot": {...},        # holdings from Etherscan
+      "audited_holdings": [...],       # each holding + its audit result
+      "portfolio_analysis": {...},     # AI portfolio risk assessment
+      "skipped_count": int,            # tokens not audited (>MAX_AUDIT_TOKENS)
+    }
+    """
+    if not is_valid_address(wallet):
+        raise ValueError(f"Invalid wallet address: {wallet}")
+
+    chain    = get_chain(chain_name)
+    api_key  = config["explorers"].get("etherscan", "")
+
+    # 1. Fetch holdings
+    snapshot = await fetch_wallet_holdings(
+        wallet, chain["id"], chain["key"], api_key
+    )
+
+    holdings  = snapshot.get("holdings", [])
+    to_audit  = holdings[:MAX_AUDIT_TOKENS]
+    skipped   = len(holdings) - len(to_audit)
+
+    # 2. Audit each token contract concurrently (non-streaming)
+    audit_tasks = [
+        run_audit(h["contract_address"], chain["key"], config, stream=False)
+        for h in to_audit
+    ]
+    audit_results = await asyncio.gather(*audit_tasks, return_exceptions=True)
+
+    audited = []
+    for holding, result in zip(to_audit, audit_results):
+        if isinstance(result, Exception):
+            audit_data = {"risk_score": 5.0, "recommendation": "UNKNOWN",
+                         "error": str(result)}
+        else:
+            _, audit_data = result
+        audited.append({**holding, "audit": audit_data})
+
+    # 3. Portfolio risk AI analysis
+    client = OpenRouterClient(
+        api_key     = config["openrouter"]["api_key"],
+        model       = config["openrouter"]["model"],
+        max_tokens  = 1500,
+        temperature = 0.1,
+    )
+    messages         = build_portfolio_prompt(wallet, chain["key"], audited)
+    portfolio_result = await client.complete(messages)
+
+    return {
+        "wallet_snapshot":    snapshot,
+        "audited_holdings":   audited,
+        "portfolio_analysis": portfolio_result,
+        "skipped_count":      skipped,
+    }
+===== ./utils/validators.py =====
+import re
+
+ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+def is_valid_address(address: str) -> bool:
+    return bool(ETH_ADDRESS_RE.match(address))
+===== ./utils/exporter.py =====
+"""utils/exporter.py — Save reports to disk as JSON/text."""
+import json
+from datetime import datetime
+from pathlib import Path
+
+REPORTS_DIR = Path.home() / ".dexai" / "reports"
+
+
+def export_report(contract: dict, audit: dict) -> Path:
+    """Save a single audit report as JSON."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    addr    = contract.get("address", "unknown")[:12]
+    chain   = contract.get("chain", "eth")
+    fname   = f"audit_{chain}_{addr}_{ts}.json"
+    path    = REPORTS_DIR / fname
+
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "contract":     {
+            k: v for k, v in contract.items()
+            if k not in ("source", "abi")  # skip large fields
+        },
+        "audit": audit,
+    }
+    path.write_text(json.dumps(report, indent=2))
+    return path
+
+
+def export_batch_report(results: list) -> Path:
+    """Save batch scan results as JSON."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path  = REPORTS_DIR / f"batch_scan_{ts}.json"
+    path.write_text(json.dumps({
+        "generated_at": datetime.now().isoformat(),
+        "count":        len(results),
+        "results":      results,
+    }, indent=2))
+    return path
+===== ./utils/cache.py =====
+import json, time
+from pathlib import Path
+
+CACHE_DIR = Path.home() / ".dexai" / "cache"
+
+def _path(address: str, chain: str) -> Path:
+    return CACHE_DIR / f"{chain}_{address.lower()}.json"
+
+def get_cached(address: str, chain: str, ttl: int = 3600) -> dict | None:
+    p = _path(address, chain)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        if time.time() - data.get("_cached_at", 0) < ttl:
+            return data
+    except Exception:
+        pass
+    return None
+
+def set_cached(address: str, chain: str, data: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    data["_cached_at"] = time.time()
+    _path(address, chain).write_text(json.dumps(data, indent=2))
+
+def clear_cache() -> int:
+    if not CACHE_DIR.exists():
+        return 0
+    files = list(CACHE_DIR.glob("*.json"))
+    for f in files:
+        f.unlink()
+    return len(files)
+===== ./utils/__init__.py =====
+===== ./utils/rate_limiter.py =====
+import asyncio, time
+
+class RateLimiter:
+    """Token-bucket rate limiter for Etherscan free tier (5 req/s)."""
+    def __init__(self, calls_per_second: int = 4):
+        self.interval = 1.0 / calls_per_second
+        self._last   = 0.0
+        self._lock   = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            now  = time.monotonic()
+            wait = self.interval - (now - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = time.monotonic()
+
+etherscan_limiter = RateLimiter(calls_per_second=4)
+===== ./ai/models.py =====
+# ai/models.py
+# OpenRouter model registry with costs + use-case notes
+
+MODELS = {
+    "claude-sonnet": {
+        "id":    "anthropic/claude-sonnet-4-5",
+        "label": "Claude Sonnet 4.5",
+        "note":  "Best Solidity reasoning, highest accuracy",
+        "cost_in":  3.00,   # USD per 1M input tokens
+        "cost_out": 15.00,  # USD per 1M output tokens
+        "tier":  "premium",
+    },
+    "deepseek-r1": {
+        "id":    "deepseek/deepseek-r1",
+        "label": "DeepSeek R1",
+        "note":  "Excellent reasoning, very cost-effective",
+        "cost_in":  0.55,
+        "cost_out": 2.19,
+        "tier":  "balanced",
+    },
+    "gemini-flash": {
+        "id":    "google/gemini-flash-2.0",
+        "label": "Gemini Flash 2.0",
+        "note":  "Fastest response time",
+        "cost_in":  0.10,
+        "cost_out": 0.40,
+        "tier":  "fast",
+    },
+    "llama-free": {
+        "id":    "meta-llama/llama-3.3-70b-instruct:free",
+        "label": "Llama 3.3 70B (Free)",
+        "note":  "Free tier — rate limited, good for testing",
+        "cost_in":  0.00,
+        "cost_out": 0.00,
+        "tier":  "free",
+    },
+}
+
+# Default recommended model
+DEFAULT_MODEL_KEY = "deepseek-r1"
+DEFAULT_MODEL_ID  = MODELS[DEFAULT_MODEL_KEY]["id"]
+
+# Fallback chain: try in order if primary fails
+FALLBACK_ORDER = ["claude-sonnet", "deepseek-r1", "gemini-flash", "llama-free"]
+
+
+def get_model_id(key: str) -> str:
+    """Return the OpenRouter model ID for a given short key."""
+    if key in MODELS:
+        return MODELS[key]["id"]
+    # Maybe user passed a raw model ID like "anthropic/claude-..."
+    for m in MODELS.values():
+        if m["id"] == key:
+            return key
+    # Return as-is and let OpenRouter validate it
+    return key
+
+
+def list_models() -> list[dict]:
+    return [{"key": k, **v} for k, v in MODELS.items()]
+===== ./ai/portfolio_prompt.py =====
+# ai/portfolio_prompt.py
+"""AI prompts for portfolio risk analysis and wallet tracking."""
+
+PORTFOLIO_SYSTEM_PROMPT = """\
+You are a DeFi portfolio risk analyst. You receive a list of token holdings with
+their individual audit results and must assess the OVERALL portfolio risk.
+
+Return ONLY valid JSON — no markdown, no text outside JSON.
+
+Required schema:
+{
+  "portfolio_risk_score": <float 0.0-10.0>,
+  "risk_grade": <"A"|"B"|"C"|"D"|"F">,
+  "critical_holdings": [<contract_address string>],
+  "safe_holdings":     [<contract_address string>],
+  "findings": [
+    {
+      "severity": <"CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO">,
+      "title":    <string>,
+      "description": <string>
+    }
+  ],
+  "pct_high_risk":   <float 0-100>,
+  "pct_safe":        <float 0-100>,
+  "concentration_risk": <bool>,
+  "recommendations": [<string>],
+  "summary": <2-3 sentence plain English summary>
+}
+
+Grade scale:
+  A : 0-2   — healthy, low-risk portfolio
+  B : 2-4   — mostly safe, minor concerns
+  C : 4-6   — mixed, some risky assets
+  D : 6-8   — significant risk exposure
+  F : 8-10  — majority high-risk or critical
+"""
+
+MONITOR_SYSTEM_PROMPT = """\
+You are a smart contract security monitor. You receive a new audit result
+for a contract that was previously audited, and must determine if anything
+has changed significantly enough to alert the holder.
+
+Return ONLY valid JSON:
+{
+  "alert": <bool>,
+  "alert_level": <"NONE"|"INFO"|"WARNING"|"CRITICAL">,
+  "changes": [<string describing what changed>],
+  "new_risk_score": <float>,
+  "old_risk_score": <float>,
+  "message": <one-line alert message for the user>,
+  "action": <"NONE"|"REVIEW"|"SELL_IMMEDIATELY">
+}
+"""
+
+
+def build_portfolio_prompt(
+    wallet: str,
+    chain: str,
+    holdings_with_audits: list[dict],
+) -> list[dict]:
+    """Build portfolio analysis prompt from holdings + their audit results."""
+
+    holding_lines = []
+    for i, h in enumerate(holdings_with_audits, 1):
+        audit = h.get("audit", {})
+        score = audit.get("risk_score", "N/A")
+        rec   = audit.get("recommendation", "UNKNOWN")
+        name  = h.get("token_name") or h.get("token_symbol") or "Unknown"
+        addr  = h.get("contract_address", "")
+        bal   = h.get("balance", 0)
+        holding_lines.append(
+            f"  {i}. {name} ({h.get('token_symbol','')})\n"
+            f"     address={addr}\n"
+            f"     balance={bal}\n"
+            f"     risk_score={score}  recommendation={rec}\n"
+            f"     honeypot={audit.get('honeypot','?')}  "
+            f"mint_fn={audit.get('mint_function','?')}  "
+            f"owner_renounced={audit.get('owner_renounced','?')}"
+        )
+
+    user_msg = f"""
+WALLET: {wallet}
+CHAIN:  {chain.upper()}
+TOTAL TOKENS HELD: {len(holdings_with_audits)}
+
+HOLDINGS WITH RISK AUDITS:
+{"".join(holding_lines) or "  No holdings found."}
+"""
+    return [
+        {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
+    ]
+
+
+def build_monitor_prompt(
+    address: str,
+    chain: str,
+    label: str,
+    old_result: dict,
+    new_result: dict,
+) -> list[dict]:
+    """Build a change-detection prompt for the monitor."""
+    user_msg = f"""
+CONTRACT: {address}
+CHAIN:    {chain.upper()}
+LABEL:    {label}
+
+PREVIOUS AUDIT:
+  risk_score:    {old_result.get('risk_score', 'N/A')}
+  recommendation:{old_result.get('recommendation', 'N/A')}
+  honeypot:      {old_result.get('honeypot', 'N/A')}
+  mint_function: {old_result.get('mint_function', 'N/A')}
+  owner_renounced:{old_result.get('owner_renounced', 'N/A')}
+  blacklist:     {old_result.get('blacklist_function', 'N/A')}
+
+CURRENT AUDIT:
+  risk_score:    {new_result.get('risk_score', 'N/A')}
+  recommendation:{new_result.get('recommendation', 'N/A')}
+  honeypot:      {new_result.get('honeypot', 'N/A')}
+  mint_function: {new_result.get('mint_function', 'N/A')}
+  owner_renounced:{new_result.get('owner_renounced', 'N/A')}
+  blacklist:     {new_result.get('blacklist_function', 'N/A')}
+
+Determine if there is a meaningful change that warrants alerting the user.
+"""
+    return [
+        {"role": "system", "content": MONITOR_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
+    ]
+===== ./ai/client.py =====
+# ai/client.py
+import json
+import httpx
+from typing import AsyncGenerator
+
+OR_BASE = "https://openrouter.ai/api/v1"
+
+
+class OpenRouterClient:
+    def __init__(self, api_key: str, model: str, max_tokens: int = 4000,
+                 temperature: float = 0.1):
+        self.model       = model
+        self.max_tokens  = max_tokens
+        self.temperature = temperature
+        self.headers = {
+            "Authorization":  f"Bearer {api_key}",
+            "Content-Type":   "application/json",
+            "HTTP-Referer":   "https://dexai.app",
+            "X-Title":        "DexAI",
+        }
+
+    def _payload(self, messages: list, stream: bool) -> dict:
+        return {
+            "model":           self.model,
+            "messages":        messages,
+            "max_tokens":      self.max_tokens,
+            "temperature":     self.temperature,
+            "stream":          stream,
+            "response_format": {"type": "json_object"},
+        }
+
+    async def stream_audit(
+        self, messages: list
+    ) -> AsyncGenerator[str, None]:
+        """Yield text chunks as they stream from OpenRouter."""
+        payload = self._payload(messages, stream=True)
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST",
+                f"{OR_BASE}/chat/completions",
+                headers=self.headers,
+                json=payload,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data: "):
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw)
+                            content = (
+                                chunk["choices"][0]
+                                .get("delta", {})
+                                .get("content", "")
+                            )
+                            if content:
+                                yield content
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+    async def complete(self, messages: list) -> dict:
+        """Non-streaming — returns parsed JSON dict."""
+        payload = self._payload(messages, stream=False)
+        payload.pop("stream")
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                f"{OR_BASE}/chat/completions",
+                headers=self.headers,
+                json=payload,
+            )
+            r.raise_for_status()
+            data    = r.json()
+            content = data["choices"][0]["message"]["content"]
+            return json.loads(content)
+===== ./ai/prompt_builder.py =====
+# ai/prompt_builder.py
+
+SYSTEM_PROMPT = """\
+You are a senior smart contract security auditor specialising in DeFi rug pull detection.
+Analyse the Solidity source code and on-chain metadata provided.
+
+Return ONLY valid JSON — no markdown, no text outside the JSON object.
+
+Required schema:
+{
+  "risk_score": <float 0.0-10.0>,
+  "recommendation": <"SAFE"|"CAUTION"|"AVOID">,
+  "honeypot": <bool>,
+  "mint_function": <bool>,
+  "owner_renounced": <bool>,
+  "proxy_pattern": <bool>,
+  "hidden_owner": <bool>,
+  "transfer_tax_modifiable": <bool>,
+  "blacklist_function": <bool>,
+  "max_tx_limit": <bool>,
+  "liquidity_concerns": <bool>,
+  "findings": [
+    {
+      "severity": <"CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO">,
+      "title": <string>,
+      "description": <string>,
+      "code_ref": <string or null>
+    }
+  ],
+  "positive_signals": [<string>],
+  "summary": <2-3 sentence plain English explanation>,
+  "audit_cost_equivalent": <"$8,000-$20,000">
+}
+
+Scoring guide:
+  0-2 : Safe — no red flags
+  3-4 : Low risk — minor issues
+  5-6 : Medium risk — use caution
+  7-8 : High risk — likely problematic
+  9-10: Critical — definite rug / honeypot
+"""
+
+# NEW: System prompt for follow‑up Q&A (conversational, no JSON)
+QA_SYSTEM_PROMPT = """\
+You are a helpful smart contract audit assistant.
+The user has already seen the full audit report with risk scores and security flags.
+Answer their follow‑up questions based on the audit you previously performed.
+Do NOT re‑audit the contract or repeat the full report.
+Be concise, helpful, and conversational.
+Do NOT return JSON unless specifically asked for structured data.
+"""
+
+
+def _format_holders(holders: list) -> str:
+    if not holders:
+        return "  Not available (Etherscan PRO required)"
+    lines = []
+    for h in holders[:5]:
+        addr = h.get("TokenHolderAddress", "?")
+        qty  = h.get("TokenHolderQuantity", "?")
+        lines.append(f"  {addr}  qty={qty}")
+    return "\n".join(lines)
+
+
+def build_audit_prompt(contract: dict) -> list[dict]:
+    """Build the full OpenRouter message array for an audit."""
+    source = contract.get("source", "") or ""
+    # Trim if source is huge — keep first 12 000 chars
+    if len(source) > 12000:
+        source = source[:12000] + "\n\n[...SOURCE TRUNCATED FOR TOKEN LIMIT...]"
+
+    user_msg = f"""
+CHAIN:          {contract.get('chain', '?')} (chainId={contract.get('chain_id', '?')})
+ADDRESS:        {contract.get('address', '?')}
+VERIFIED:       {contract.get('verified', False)}
+COMPILER:       {contract.get('compiler', 'unknown')}
+IS PROXY:       {contract.get('proxy', False)}
+IMPLEMENTATION: {contract.get('implementation', 'N/A')}
+LICENSE:        {contract.get('license', 'None')}
+DEPLOYER:       {contract.get('creator', 'unknown')}
+DEPLOY TX:      {contract.get('tx_hash', 'unknown')}
+
+TOKEN INFO:
+  Name:         {contract.get('token_name', 'N/A')}
+  Symbol:       {contract.get('token_symbol', 'N/A')}
+  Total Supply: {contract.get('total_supply', 'N/A')}
+  Holder Count: {contract.get('holders', 'N/A')}
+
+TOP 5 HOLDERS:
+{_format_holders(contract.get('top_holders', []))}
+
+━━━ SOLIDITY SOURCE CODE ━━━
+{source if source else "SOURCE NOT AVAILABLE — contract not verified on-chain."}
+"""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
+    ]
+
+
+def build_qa_prompt(
+    contract: dict,
+    history: list[dict],
+    question: str,
+    audit_result: dict = None,      # <-- accepts audit_result
+) -> list[dict]:
+    """
+    Build a follow-up Q&A prompt WITHOUT re‑auditing the contract.
+    """
+    # Short contract context
+    context = f"""Contract: {contract.get('address', 'unknown')} on {contract.get('chain', 'unknown')}
+Token: {contract.get('token_name', 'N/A')} ({contract.get('token_symbol', 'N/A')})"""
+
+    # Add previous audit summary if provided
+    audit_summary = ""
+    if audit_result:
+        risk = audit_result.get('risk_score', 'N/A')
+        rec = audit_result.get('recommendation', 'N/A')
+        summary = audit_result.get('summary', '')
+        audit_summary = f"""
+Previous audit result:
+  Risk score: {risk}/10
+  Recommendation: {rec}
+  Summary: {summary}
+"""
+
+    user_content = f"""Context from previously audited contract:
+
+{context}
+{audit_summary}
+
+Answer the user's question based on the audit you already performed.
+Do NOT re‑audit.
+Be conversational and helpful.
+
+User question: {question}"""
+
+    messages = [
+        {"role": "system", "content": QA_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+    # Add recent conversation history (last 4 turns) for continuity
+    if history:
+        messages.extend(history[-4:])
+    return messages
+===== ./ai/__init__.py =====
+===== ./ai/deployer_prompt.py =====
+# ai/deployer_prompt.py
+"""
+AI prompt builder for deployer forensics analysis.
+Takes the raw deployer profile and asks the AI to reason about
+patterns, history, and serial rug behaviour.
+"""
+from datetime import datetime, timezone
+
+DEPLOYER_SYSTEM_PROMPT = """\
+You are a blockchain forensics expert specialising in identifying serial rug pull operators.
+Analyse the deployer wallet history provided and return ONLY valid JSON — no text outside JSON.
+
+Required schema:
+{
+  "risk_score": <float 0.0-10.0>,
+  "verdict": <"CLEAN"|"SUSPICIOUS"|"KNOWN_RUGGER"|"SERIAL_RUGGER">,
+  "pattern": <one-line description of the deployer's behaviour pattern>,
+  "findings": [
+    {
+      "severity": <"CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO">,
+      "title": <string>,
+      "description": <string>
+    }
+  ],
+  "chain_hopping": <bool>,
+  "identity_obfuscation": <bool>,
+  "reuse_pattern": <bool>,
+  "estimated_victims": <int or null>,
+  "total_contracts_deployed": <int>,
+  "red_flags": [<string>],
+  "summary": <2-3 sentence plain English summary>,
+  "recommendation": <"TRUST"|"CAUTION"|"AVOID"|"BLACKLIST">
+}
+
+Scoring:
+  0-2 : Clean — normal developer activity
+  3-4 : Suspicious — some concerning patterns
+  5-6 : Likely bad actor — multiple red flags
+  7-8 : Known rug pattern — strong evidence
+  9-10: Serial rugger — definitive serial bad actor
+
+Look for:
+  - Repeated deploy + abandon pattern (contract dies within days/weeks)
+  - Low holder counts across deployed contracts (pump-and-dump signal)
+  - Unverified contracts (hiding malicious code)
+  - Multi-chain hopping (evading chain-specific blacklists)
+  - Similar token names/symbols (recycling the same scam)
+  - Rapid deployment bursts (assembly-line rugger)
+  - Known mixer/tornado as funder (identity hiding)
+"""
+
+
+def _format_deployments(deployments: list[dict], limit: int = 15) -> str:
+    lines = []
+    for d in deployments[:limit]:
+        name    = d.get("token_name", "") or d.get("contract_name", "") or "Unknown"
+        symbol  = d.get("token_symbol", "")
+        holders = d.get("holder_count", "?")
+        verified = "✓ verified" if d.get("verified") else "✗ unverified"
+        lines.append(
+            f"  [{d['chain'].upper()}] {d['date']}  "
+            f"{name} ({symbol})  "
+            f"holders={holders}  {verified}\n"
+            f"  address={d['contract_address']}"
+        )
+    if len(deployments) > limit:
+        lines.append(f"  ... and {len(deployments) - limit} more contracts")
+    return "\n".join(lines)
+
+
+def build_deployer_prompt(profile: dict) -> list[dict]:
+    funder  = profile.get("funder", {})
+    signals = profile.get("risk_signals", {})
+
+    user_msg = f"""
+DEPLOYER WALLET: {profile['deployer']}
+TOTAL CONTRACTS DEPLOYED: {profile['total_deployments']}
+CHAINS ACTIVE: {', '.join(profile['chains_active']) or 'none found'}
+CHAINS SCANNED: {', '.join(profile['chains_scanned'])}
+
+FUNDING SOURCE:
+  Funder wallet: {funder.get('funder_address', 'unknown')}
+  Funding date:  {funder.get('funding_date', 'unknown')}
+  Amount funded: {funder.get('funding_value_eth', '?')} ETH
+  Funding tx:    {funder.get('funding_tx', 'unknown')}
+
+RISK SIGNALS:
+  Multi-chain deployer:         {signals.get('multi_chain_deployer', False)}
+  Has unverified contracts:     {signals.get('has_unverified_contracts', False)}
+  Unverified contract count:    {signals.get('unverified_count', 0)}
+  Rapid deployment burst:       {signals.get('rapid_deployments', False)}
+  Low-holder contracts (<50):   {signals.get('low_holder_contracts', 0)}
+
+DEPLOYMENT HISTORY (newest first):
+{_format_deployments(profile.get('deployments', []))}
+"""
+    return [
+        {"role": "system", "content": DEPLOYER_SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
+    ]
+===== ./keygen.py =====
+#!/usr/bin/env python3
+"""
+DexAI — Seller Key Management Tool
+===================================
+Run this ONCE to generate your Ed25519 keypair.
+Then use it to sign license keys for buyers.
+
+NEVER commit your private key to any repository.
+
+Usage:
+  python keygen.py generate           → create keypair, save to keys/
+  python keygen.py sign <device_id>   → sign a buyer's device ID
+  python keygen.py verify <device_id> <license_key>
+"""
+import sys
+import json
+from pathlib import Path
+
+# Always run from project root
+sys.path.insert(0, str(Path(__file__).parent))
+
+from core.license import generate_keypair, sign_license, validate_license, get_device_id
+from rich.console import Console
+from rich.panel import Panel
+
+console = Console()
+KEYS_DIR = Path("keys")
+
+
+def cmd_generate():
+    """Generate a fresh keypair and save to keys/ directory."""
+    if KEYS_DIR.exists() and (KEYS_DIR / "private.pem").exists():
+        console.print("[yellow]⚠ keys/private.pem already exists.[/yellow]")
+        if input("Overwrite? (yes/no): ").strip().lower() != "yes":
+            console.print("Aborted.")
+            return
+
+    KEYS_DIR.mkdir(exist_ok=True)
+    priv_pem, pub_pem = generate_keypair()
+
+    (KEYS_DIR / "private.pem").write_text(priv_pem)
+    (KEYS_DIR / "public.pem").write_text(pub_pem)
+
+    # Protect private key file permissions (Unix)
+    try:
+        (KEYS_DIR / "private.pem").chmod(0o600)
+    except Exception:
+        pass
+
+    console.print(Panel(
+        f"[green bold]✓ Keypair generated[/green bold]\n\n"
+        f"  Private key: [bold]keys/private.pem[/bold]  ← KEEP SECRET\n"
+        f"  Public key:  [bold]keys/public.pem[/bold]\n\n"
+        f"[yellow]Next step:[/yellow]\n"
+        f"  Copy the contents of [bold]keys/public.pem[/bold] into\n"
+        f"  [bold]core/license.py → BAKED_PUBLIC_KEY_PEM[/bold]\n"
+        f"  Then rebuild the binary.",
+        title="Key Generation Complete",
+        border_style="green",
+    ))
+
+    console.print("\n[bold]Public key (paste into core/license.py):[/bold]")
+    console.print(pub_pem)
+
+
+def cmd_sign(device_id: str):
+    """Sign a buyer's device_id and print their license key."""
+    priv_path = KEYS_DIR / "private.pem"
+    if not priv_path.exists():
+        console.print("[red]✗ keys/private.pem not found. Run: python keygen.py generate[/red]")
+        sys.exit(1)
+
+    priv_pem    = priv_path.read_text()
+    license_key = sign_license(device_id, priv_pem)
+
+    console.print(Panel(
+        f"Device ID:   [bold cyan]{device_id}[/bold cyan]\n\n"
+        f"License Key:\n[bold green]{license_key}[/bold green]\n\n"
+        f"Send this key to the buyer via Whop/Gumroad email.",
+        title="License Key Generated",
+        border_style="green",
+    ))
+
+
+def cmd_verify(device_id: str, license_key: str):
+    """Verify that a license key is valid for a given device_id."""
+    # Temporarily patch the validate function to use our public key
+    pub_path = KEYS_DIR / "public.pem"
+    if not pub_path.exists():
+        console.print("[red]✗ keys/public.pem not found.[/red]")
+        sys.exit(1)
+
+    import base64
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    pub_key = load_pem_public_key(pub_path.read_bytes())
+    try:
+        sig = base64.urlsafe_b64decode(license_key.encode())
+        pub_key.verify(sig, device_id.encode())
+        console.print(f"[green bold]✓ VALID[/green bold] — key is authentic for device {device_id}")
+    except Exception:
+        console.print(f"[red bold]✗ INVALID[/red bold] — key does not match device {device_id}")
+
+
+def cmd_my_device():
+    """Print this machine's device ID (for testing)."""
+    did = get_device_id()
+    console.print(f"This device's ID: [bold cyan]{did}[/bold cyan]")
+
+
+COMMANDS = {
+    "generate":  (cmd_generate,  0),
+    "sign":      (cmd_sign,      1),
+    "verify":    (cmd_verify,    2),
+    "device-id": (cmd_my_device, 0),
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        console.print(
+            "[bold]Usage:[/bold]\n"
+            "  python keygen.py generate\n"
+            "  python keygen.py sign <device_id>\n"
+            "  python keygen.py verify <device_id> <license_key>\n"
+            "  python keygen.py device-id\n"
+        )
+        sys.exit(1)
+
+    cmd, nargs = COMMANDS[sys.argv[1]]
+    args = sys.argv[2:]
+    if len(args) < nargs:
+        console.print(f"[red]Missing arguments for '{sys.argv[1]}'[/red]")
+        sys.exit(1)
+    cmd(*args[:nargs])
+===== ./report/__init__.py =====
+===== ./report/deployer_renderer.py =====
+# report/deployer_renderer.py
+"""Rich terminal renderer for deployer forensics reports."""
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.rule import Rule
+from rich import box
+
+from report.risk_scorer import risk_color, risk_label, bool_icon
+
+console = Console()
+
+VERDICT_COLORS = {
+    "CLEAN":         "green",
+    "SUSPICIOUS":    "yellow",
+    "KNOWN_RUGGER":  "red",
+    "SERIAL_RUGGER": "bold red",
+}
+
+VERDICT_ICONS = {
+    "CLEAN":         "✅",
+    "SUSPICIOUS":    "⚠️",
+    "KNOWN_RUGGER":  "🚨",
+    "SERIAL_RUGGER": "💀",
+}
+
+REC_COLORS = {
+    "TRUST":     "green",
+    "CAUTION":   "yellow",
+    "AVOID":     "red",
+    "BLACKLIST": "bold red",
+}
+
+
+def render_deployer_report(result: dict, profile: dict) -> None:
+    score   = result.get("risk_score", 0.0)
+    verdict = result.get("verdict", "SUSPICIOUS")
+    r_col   = risk_color(score)
+    v_col   = VERDICT_COLORS.get(verdict, "white")
+    v_icon  = VERDICT_ICONS.get(verdict, "•")
+
+    console.print()
+    console.rule("[bold]DexAI — Deployer Forensics Report[/bold]", style="cyan")
+    console.print(f"  [dim]Wallet:[/dim]  {profile['deployer']}")
+    console.print(
+        f"  [dim]Chains scanned:[/dim]  "
+        f"{', '.join(profile.get('chains_scanned', []))}"
+    )
+    console.print()
+
+    # ── Verdict Panel ─────────────────────────────────────────────────────────
+    rec     = result.get("recommendation", "CAUTION")
+    rec_col = REC_COLORS.get(rec, "white")
+    score_bar = "█" * int((score / 10) * 20) + "░" * (20 - int((score / 10) * 20))
+
+    console.print(Panel(
+        f"[{r_col}]{score:.1f} / 10[/{r_col}]  [dim]{score_bar}[/dim]  "
+        f"[{r_col}]{risk_label(score)}[/{r_col}]\n\n"
+        f"Verdict:        [{v_col}]{v_icon} {verdict}[/{v_col}]\n"
+        f"Recommendation: [bold {rec_col}]{rec}[/bold {rec_col}]",
+        title="[bold]Risk Assessment[/bold]",
+        border_style=r_col,
+        padding=(0, 2),
+    ))
+    console.print()
+
+    # ── Stats Row ─────────────────────────────────────────────────────────────
+    stats = Table(box=box.SIMPLE, show_header=False, padding=(0, 3))
+    stats.add_column("Label", style="dim", width=28)
+    stats.add_column("Value", style="bold")
+
+    funder = profile.get("funder", {})
+    stats.add_row("Contracts deployed",  str(profile.get("total_deployments", 0)))
+    stats.add_row("Chains active",       ", ".join(profile.get("chains_active", [])) or "none")
+    stats.add_row("Funder wallet",       funder.get("funder_address", "unknown")[:20] + "…")
+    stats.add_row("First funded",        funder.get("funding_date", "unknown"))
+    stats.add_row("Chain hopping",       bool_icon(result.get("chain_hopping", False)))
+    stats.add_row("Identity obfuscation",bool_icon(result.get("identity_obfuscation", False)))
+    stats.add_row("Reuse pattern",       bool_icon(result.get("reuse_pattern", False)))
+    stats.add_row("Estimated victims",   str(result.get("estimated_victims") or "unknown"))
+
+    console.print(Panel(stats, title="[bold]Deployer Profile[/bold]", border_style="blue"))
+    console.print()
+
+    # ── Red Flags ─────────────────────────────────────────────────────────────
+    flags = result.get("red_flags", [])
+    if flags:
+        console.print("[bold red]Red Flags[/bold red]")
+        for f in flags:
+            console.print(f"  [red]⚑[/red] {f}")
+        console.print()
+
+    # ── Findings ─────────────────────────────────────────────────────────────
+    findings = result.get("findings", [])
+    if findings:
+        console.print("[bold]Findings[/bold]")
+        sev_colors = {
+            "CRITICAL": "bold red", "HIGH": "red",
+            "MEDIUM": "yellow",     "LOW": "cyan", "INFO": "dim",
+        }
+        sev_icons = {
+            "CRITICAL": "🔴", "HIGH": "🟠",
+            "MEDIUM": "🟡",  "LOW": "🔵", "INFO": "⚪",
+        }
+        for f in findings:
+            sev   = f.get("severity", "INFO")
+            col   = sev_colors.get(sev, "white")
+            icon  = sev_icons.get(sev, "•")
+            console.print(
+                f"  {icon} [{col}]{sev}[/{col}]  [bold]{f.get('title', '')}[/bold]"
+            )
+            console.print(f"     {f.get('description', '')}")
+        console.print()
+
+    # ── Deployment History Table ──────────────────────────────────────────────
+    deployments = profile.get("deployments", [])
+    if deployments:
+        console.print("[bold]Deployment History[/bold]")
+        t = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
+        t.add_column("Date",     style="dim",  width=12)
+        t.add_column("Chain",    style="cyan", width=8)
+        t.add_column("Token",    width=18)
+        t.add_column("Holders",  justify="right", width=8)
+        t.add_column("Verified", width=10)
+        t.add_column("Address",  style="dim", width=14)
+
+        for d in deployments[:12]:
+            name     = (d.get("token_name") or d.get("contract_name") or "—")[:16]
+            holders  = d.get("holder_count", "?") or "?"
+            verified = "[green]✓[/green]" if d.get("verified") else "[red]✗[/red]"
+            addr     = d.get("contract_address", "")
+            short_addr = addr[:6] + "…" + addr[-4:] if addr else "—"
+            date_str   = d.get("date", "")[:10]
+            t.add_row(date_str, d.get("chain","").upper(), name,
+                      str(holders), verified, short_addr)
+
+        console.print(t)
+        if len(deployments) > 12:
+            console.print(f"  [dim]... and {len(deployments)-12} more[/dim]")
+        console.print()
+
+    # ── Pattern + Summary ─────────────────────────────────────────────────────
+    if pattern := result.get("pattern"):
+        console.print(f"[bold]Behaviour Pattern:[/bold] {pattern}\n")
+
+    if summary := result.get("summary"):
+        console.print(Panel(
+            summary,
+            title="[bold]Summary[/bold]",
+            border_style="dim",
+        ))
+    console.rule(style="dim")
+
+
+def render_deployer_spinner(address: str, chains: list[str]) -> None:
+    console.print(
+        f"\n[cyan]⟳[/cyan]  Scanning deployer [bold]{address[:10]}…[/bold]"
+    )
+    console.print(
+        f"[cyan]⟳[/cyan]  Chains: [dim]{', '.join(chains)}[/dim]"
+    )
+    console.print(
+        "[cyan]⟳[/cyan]  Fetching deployment history (this takes ~10s)…\n"
+    )
+===== ./report/portfolio_renderer.py =====
+# report/portfolio_renderer.py
+"""Rich terminal renderers for wallet tracker + portfolio monitor."""
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich import box
+
+from report.risk_scorer import risk_color, risk_label, bool_icon
+
+console = Console()
+
+GRADE_COLORS = {"A": "green", "B": "cyan", "C": "yellow", "D": "red", "F": "bold red"}
+ALERT_COLORS = {
+    "NONE":     "dim",
+    "INFO":     "cyan",
+    "WARNING":  "yellow",
+    "CRITICAL": "bold red",
+}
+ALERT_ICONS = {
+    "NONE": "·", "INFO": "ℹ", "WARNING": "⚠", "CRITICAL": "🚨",
+}
+
+
+# ── Wallet Tracker ─────────────────────────────────────────────────────────────
+
+def render_wallet_report(data: dict) -> None:
+    snap     = data["wallet_snapshot"]
+    audited  = data["audited_holdings"]
+    analysis = data["portfolio_analysis"]
+    skipped  = data["skipped_count"]
+
+    wallet = snap["wallet"]
+    chain  = snap["chain"].upper()
+
+    console.print()
+    console.rule("[bold]DexAI — Wallet Risk Report[/bold]", style="cyan")
+    console.print(f"  [dim]Wallet:[/dim] {wallet}")
+    console.print(f"  [dim]Chain:[/dim]  {chain}")
+    console.print()
+
+    # ── Portfolio Score Panel ──────────────────────────────────────────────
+    score  = analysis.get("portfolio_risk_score", 0.0)
+    grade  = analysis.get("risk_grade", "?")
+    r_col  = risk_color(score)
+    g_col  = GRADE_COLORS.get(grade, "white")
+    bar    = "█" * int((score / 10) * 20) + "░" * (20 - int((score / 10) * 20))
+
+    pct_high = analysis.get("pct_high_risk", 0.0)
+    pct_safe = analysis.get("pct_safe", 0.0)
+
+    console.print(Panel(
+        f"Portfolio Risk Score: [{r_col}]{score:.1f} / 10[/{r_col}]  "
+        f"[dim]{bar}[/dim]\n"
+        f"Grade: [{g_col}]{grade}[/{g_col}]  ·  "
+        f"High-risk exposure: [{r_col}]{pct_high:.0f}%[/{r_col}]  ·  "
+        f"Safe: [green]{pct_safe:.0f}%[/green]",
+        title="[bold]Portfolio Risk[/bold]",
+        border_style=r_col,
+        padding=(0, 2),
+    ))
+    console.print()
+
+    # ── Holdings Table ─────────────────────────────────────────────────────
+    console.print(f"[bold]Token Holdings[/bold]  "
+                  f"[dim]({snap['token_count']} tokens, "
+                  f"audited top {len(audited)})[/dim]")
+
+    t = Table(box=box.SIMPLE, padding=(0, 1), show_header=True)
+    t.add_column("#",        width=3,  justify="right")
+    t.add_column("Token",    width=14, style="bold")
+    t.add_column("Symbol",   width=8)
+    t.add_column("Balance",  width=14, justify="right")
+    t.add_column("Score",    width=7,  justify="center")
+    t.add_column("Risk",     width=10)
+    t.add_column("Rec",      width=10)
+    t.add_column("Address",  width=14, style="dim")
+
+    for i, h in enumerate(audited, 1):
+        audit  = h.get("audit", {})
+        score_ = audit.get("risk_score", 0.0) or 0.0
+        rec    = audit.get("recommendation", "?")
+        r_c    = risk_color(score_)
+        rec_c  = {"SAFE": "green", "CAUTION": "yellow",
+                  "AVOID": "red"}.get(rec, "white")
+        name   = (h.get("token_name") or "?")[:12]
+        sym    = (h.get("token_symbol") or "?")[:7]
+        bal    = f"{h.get('balance', 0):,.4f}"
+        addr   = h.get("contract_address", "")
+        short  = addr[:6] + "…" + addr[-4:] if addr else "—"
+
+        t.add_row(
+            str(i), name, sym, bal,
+            f"[{r_c}]{score_:.1f}[/{r_c}]",
+            f"[{r_c}]{risk_label(score_)}[/{r_c}]",
+            f"[{rec_c}]{rec}[/{rec_c}]",
+            short,
+        )
+
+    console.print(t)
+
+    if skipped > 0:
+        console.print(
+            f"  [dim]+ {skipped} more tokens not audited "
+            f"(run dexai audit <address> --chain {snap['chain']} for full details)[/dim]"
+        )
+    console.print()
+
+    # ── Portfolio Findings ─────────────────────────────────────────────────
+    findings = analysis.get("findings", [])
+    if findings:
+        console.print("[bold]Portfolio Findings[/bold]")
+        sev_c = {"CRITICAL": "bold red", "HIGH": "red",
+                 "MEDIUM": "yellow",     "LOW": "cyan", "INFO": "dim"}
+        sev_i = {"CRITICAL": "🔴", "HIGH": "🟠",
+                 "MEDIUM": "🟡",  "LOW": "🔵", "INFO": "⚪"}
+        for f in findings:
+            s = f.get("severity", "INFO")
+            console.print(
+                f"  {sev_i.get(s,'•')} [{sev_c.get(s,'white')}]{s}[/{sev_c.get(s,'white')}]"
+                f"  [bold]{f.get('title','')}[/bold]"
+            )
+            console.print(f"     {f.get('description','')}")
+        console.print()
+
+    # ── Recommendations ────────────────────────────────────────────────────
+    recs = analysis.get("recommendations", [])
+    if recs:
+        console.print("[bold]Recommendations[/bold]")
+        for r in recs:
+            console.print(f"  [cyan]→[/cyan] {r}")
+        console.print()
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    if summary := analysis.get("summary"):
+        console.print(Panel(summary, title="[bold]Summary[/bold]", border_style="dim"))
+    console.rule(style="dim")
+
+
+def render_wallet_spinner(wallet: str, chain: str) -> None:
+    console.print(f"\n[cyan]⟳[/cyan]  Fetching holdings for [bold]{wallet[:12]}…[/bold] on [bold]{chain.upper()}[/bold]")
+    console.print("[cyan]⟳[/cyan]  Auditing tokens (this may take 30-60s)…\n")
+
+
+# ── Portfolio Monitor ──────────────────────────────────────────────────────────
+
+def render_watchlist(entries: list[dict]) -> None:
+    if not entries:
+        console.print("\n[dim]Watchlist is empty. Add contracts with:[/dim]")
+        console.print("  [bold]dexai watch add 0xABC --chain bsc[/bold]\n")
+        return
+
+    console.print(f"\n[bold]Watchlist[/bold]  [dim]({len(entries)} contracts)[/dim]\n")
+    t = Table(box=box.SIMPLE, padding=(0, 1))
+    t.add_column("Label",        width=20, style="bold")
+    t.add_column("Chain",        width=8,  style="cyan")
+    t.add_column("Address",      width=14, style="dim")
+    t.add_column("Last Score",   width=10, justify="center")
+    t.add_column("Last Verdict", width=12)
+    t.add_column("Last Checked", width=16, style="dim")
+    t.add_column("Threshold",    width=10, justify="center")
+
+    for e in entries:
+        score   = e.get("last_risk_score")
+        verdict = e.get("last_verdict") or "—"
+        addr    = e.get("address", "")
+        short   = addr[:6] + "…" + addr[-4:] if addr else "—"
+        checked = (e.get("last_checked") or "never")[:16]
+        thresh  = str(e.get("alert_threshold", 6.0))
+
+        if score is not None:
+            r_c      = risk_color(score)
+            score_s  = f"[{r_c}]{score:.1f}[/{r_c}]"
+            v_c      = {"SAFE": "green", "CAUTION": "yellow",
+                        "AVOID": "red"}.get(verdict, "white")
+            verdict_s = f"[{v_c}]{verdict}[/{v_c}]"
+        else:
+            score_s  = "[dim]—[/dim]"
+            verdict_s = "[dim]not checked[/dim]"
+
+        t.add_row(
+            e.get("label", "")[:18], e.get("chain","").upper(),
+            short, score_s, verdict_s, checked, thresh,
+        )
+    console.print(t)
+
+
+def render_monitor_results(results: list[dict]) -> None:
+    """Print results from one monitor cycle."""
+    alerts = [r for r in results if r.get("alert")]
+    clean  = [r for r in results if not r.get("alert") and not r.get("error")]
+    errors = [r for r in results if r.get("error")]
+
+    now = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+    console.print(f"\n[dim]── Monitor cycle at {now} ──[/dim]")
+    console.print(
+        f"  Checked: [bold]{len(results)}[/bold]  "
+        f"Alerts: [{'bold red' if alerts else 'dim'}]{len(alerts)}[/{'bold red' if alerts else 'dim'}]  "
+        f"Clean: [green]{len(clean)}[/green]  "
+        f"Errors: [dim]{len(errors)}[/dim]"
+    )
+
+    for a in alerts:
+        level = a.get("alert_level", "WARNING")
+        icon  = ALERT_ICONS.get(level, "⚠")
+        color = ALERT_COLORS.get(level, "yellow")
+        console.print(
+            f"\n  {icon} [{color}]{level}[/{color}]  "
+            f"[bold]{a.get('label', a.get('address','')[:10])}[/bold]  "
+            f"[{a.get('chain','').upper()}]"
+        )
+        console.print(f"     {a.get('message', '')}")
+        if a.get("old_score") is not None:
+            old_c = risk_color(a["old_score"])
+            new_c = risk_color(a["new_score"])
+            console.print(
+                f"     Score: [{old_c}]{a['old_score']:.1f}[/{old_c}]"
+                f" → [{new_c}]{a['new_score']:.1f}[/{new_c}]"
+            )
+        action = a.get("action", "NONE")
+        if action != "NONE":
+            a_c = "bold red" if action == "SELL_IMMEDIATELY" else "yellow"
+            console.print(f"     Action: [{a_c}]{action}[/{a_c}]")
+        for change in a.get("changes", [])[:3]:
+            console.print(f"     [dim]• {change}[/dim]")
+
+    for e in errors:
+        console.print(
+            f"\n  [red]✗[/red]  {e.get('label', e.get('address','')[:10])}  "
+            f"[dim]{e.get('error', '')}[/dim]"
+        )
+
+    if not alerts:
+        console.print("  [green]✓[/green]  All contracts within normal parameters")
+
+
+def render_monitor_spinner(count: int, interval: int) -> None:
+    console.print(
+        f"\n[cyan]⟳[/cyan]  Monitoring [bold]{count}[/bold] contracts "
+        f"every [bold]{interval}[/bold] minutes"
+    )
+    console.print("[dim]  Press Ctrl+C to stop[/dim]\n")
+===== ./report/risk_scorer.py =====
+# report/risk_scorer.py
+
+SEVERITY_COLORS = {
+    "CRITICAL": "bold red",
+    "HIGH":     "red",
+    "MEDIUM":   "yellow",
+    "LOW":      "cyan",
+    "INFO":     "dim",
+}
+
+SEVERITY_ICONS = {
+    "CRITICAL": "🔴",
+    "HIGH":     "🟠",
+    "MEDIUM":   "🟡",
+    "LOW":      "🔵",
+    "INFO":     "⚪",
+}
+
+def risk_color(score: float) -> str:
+    if score >= 8.0: return "bold red"
+    if score >= 6.0: return "red"
+    if score >= 4.0: return "yellow"
+    if score >= 2.0: return "cyan"
+    return "green"
+
+def risk_label(score: float) -> str:
+    if score >= 8.0: return "CRITICAL"
+    if score >= 6.0: return "HIGH"
+    if score >= 4.0: return "MEDIUM"
+    if score >= 2.0: return "LOW"
+    return "SAFE"
+
+def recommendation_color(rec: str) -> str:
+    return {"SAFE": "green", "CAUTION": "yellow", "AVOID": "red"}.get(rec, "white")
+
+def bool_icon(val: bool, danger_if_true: bool = True) -> str:
+    if danger_if_true:
+        return "[red]YES ⚠[/red]" if val else "[green]NO ✓[/green]"
+    else:
+        return "[green]YES ✓[/green]" if val else "[red]NO ✗[/red]"
+===== ./report/renderer.py =====
+# report/renderer.py
+import json
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.rule import Rule
+from rich import box
+from report.risk_scorer import (
+    risk_color, risk_label, recommendation_color,
+    bool_icon, SEVERITY_COLORS, SEVERITY_ICONS,
+)
+
+console = Console()
+
+
+def render_audit(result: dict, address: str, chain: str) -> None:
+    """Render the full audit report to the terminal."""
+    score  = result.get("risk_score", 0.0)
+    rec    = result.get("recommendation", "CAUTION")
+    r_col  = risk_color(score)
+    r_lbl  = risk_label(score)
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    console.print()
+    console.rule(f"[bold]DexAI — Contract Audit Report[/bold]", style="cyan")
+    console.print(f"  [dim]Address:[/dim] {address}")
+    console.print(f"  [dim]Chain:[/dim]   {chain.upper()}")
+    console.print()
+
+    # ── Risk Score ──────────────────────────────────────────────────────────
+    score_bar = _score_bar(score)
+    console.print(
+        Panel(
+            f"[{r_col}]{score:.1f} / 10[/{r_col}]  {score_bar}  "
+            f"[bold {r_col}]{r_lbl}[/bold {r_col}]\n\n"
+            f"Recommendation: [bold {recommendation_color(rec)}]{rec}[/bold {recommendation_color(rec)}]",
+            title="[bold]Risk Score[/bold]",
+            border_style=r_col,
+            padding=(0, 2),
+        )
+    )
+    console.print()
+
+    # ── Security Flags ───────────────────────────────────────────────────────
+    flags = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    flags.add_column("Flag",  style="bold", width=30)
+    flags.add_column("Value", width=20)
+
+    flag_rows = [
+        ("Honeypot",                    result.get("honeypot", False),                True),
+        ("Mint Function",               result.get("mint_function", False),            True),
+        ("Owner Renounced",             result.get("owner_renounced", False),          False),
+        ("Proxy Pattern",               result.get("proxy_pattern", False),            True),
+        ("Hidden Owner",                result.get("hidden_owner", False),             True),
+        ("Transfer Tax Modifiable",     result.get("transfer_tax_modifiable", False),  True),
+        ("Blacklist Function",          result.get("blacklist_function", False),       True),
+        ("Max TX Limit",                result.get("max_tx_limit", False),             True),
+        ("Liquidity Concerns",          result.get("liquidity_concerns", False),      True),
+    ]
+    for label, val, danger in flag_rows:
+        flags.add_row(label, bool_icon(val, danger_if_true=danger))
+
+    console.print(Panel(flags, title="[bold]Security Flags[/bold]", border_style="blue"))
+    console.print()
+
+    # ── Findings ────────────────────────────────────────────────────────────
+    findings = result.get("findings", [])
+    if findings:
+        console.print("[bold]Findings[/bold]")
+        for f in findings:
+            sev   = f.get("severity", "INFO")
+            color = SEVERITY_COLORS.get(sev, "white")
+            icon  = SEVERITY_ICONS.get(sev, "•")
+            console.print(
+                f"  {icon} [{color}]{sev}[/{color}]  [bold]{f.get('title', '')}[/bold]"
+            )
+            console.print(f"     {f.get('description', '')}")
+            if ref := f.get("code_ref"):
+                console.print(f"     [dim]↳ {ref}[/dim]")
+            console.print()
+
+    # ── Positive Signals ────────────────────────────────────────────────────
+    positives = result.get("positive_signals", [])
+    if positives:
+        console.print("[bold green]Positive Signals[/bold green]")
+        for p in positives:
+            console.print(f"  [green]✓[/green] {p}")
+        console.print()
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    if summary := result.get("summary"):
+        console.print(
+            Panel(summary, title="[bold]Summary[/bold]", border_style="dim")
+        )
+        console.print()
+
+    cost_eq = result.get("audit_cost_equivalent", "$8,000-$20,000")
+    console.print(
+        f"[dim]💡 Equivalent professional audit cost: {cost_eq}[/dim]"
+    )
+    console.rule(style="dim")
+
+
+def render_spinner_start(address: str, chain: str, model: str) -> None:
+    console.print(
+        f"\n[cyan]⟳[/cyan]  Fetching [bold]{address[:10]}…[/bold] "
+        f"on [bold]{chain.upper()}[/bold]"
+    )
+    console.print(f"[cyan]⟳[/cyan]  Running AI audit via [dim]{model}[/dim]\n")
+
+
+def render_stream_token(token: str) -> None:
+    """Print a streaming token without newline."""
+    console.print(token, end="", highlight=False)
+
+
+def render_error(msg: str) -> None:
+    console.print(f"\n[red]✗ Error:[/red] {msg}\n")
+
+
+def _score_bar(score: float, width: int = 20) -> str:
+    filled = int((score / 10.0) * width)
+    bar    = "█" * filled + "░" * (width - filled)
+    return f"[dim]{bar}[/dim]"
+===== ./main.py =====
+#!/usr/bin/env python3
+"""DexAI — AI Smart Contract Auditor + Deployer Forensics + Portfolio Monitor"""
+import typer
+from rich.console import Console
+
+from core.config import load_config, validate_keys
+from core.chains import CHAINS, resolve_chain
+from ai.models import get_model_id
+import cli.config_cmd as config_mod
+import cli.watch_cmd  as watch_mod
+
+console = Console()
+app = typer.Typer(
+    name="dexai",
+    help="[bold cyan]DexAI[/bold cyan] — AI Smart Contract Auditor",
+    add_completion=False,
+)
+app.add_typer(config_mod.app, name="config")
+app.add_typer(watch_mod.app,  name="watch")
+
+
+# ── audit ─────────────────────────────────────────────────────────────────────
+@app.command()
+def audit(
+    address:   str  = typer.Argument(..., help="Contract address (0x...)"),
+    chain:     str  = typer.Option("eth",  "--chain", "-c",
+                                   help=f"Chain: {', '.join(CHAINS.keys())}"),
+    model:     str  = typer.Option(None,   "--model", "-m"),
+    no_qa:     bool = typer.Option(False,  "--no-qa"),
+    no_stream: bool = typer.Option(False,  "--no-stream"),
+    json_out:  bool = typer.Option(False,  "--json"),
+):
+    """Audit a smart contract for rug pull risks."""
+    from cli.audit import audit_command
+    config    = load_config()
+    chain_key = resolve_chain(chain)
+    if chain_key not in CHAINS:
+        console.print(f"[red]Unknown chain '{chain}'[/red]")
+        raise typer.Exit(1)
+    if not validate_keys(config): raise typer.Exit(1)
+    audit_command(
+        address        = address,
+        chain          = chain_key,
+        config         = config,
+        model_override = get_model_id(model) if model else None,
+        no_stream      = no_stream,
+        qa_mode        = not no_qa,
+    )
+
+
+# ── deployer ──────────────────────────────────────────────────────────────────
+@app.command()
+def deployer(
+    address:   str       = typer.Argument(..., help="Deployer wallet address"),
+    chain:     list[str] = typer.Option(None,  "--chain", "-c",
+                           help="Chains to scan (repeat). Default: eth bsc polygon base arb"),
+    model:     str  = typer.Option(None,  "--model", "-m"),
+    no_stream: bool = typer.Option(False, "--no-stream"),
+    json_out:  bool = typer.Option(False, "--json"),
+):
+    """
+    Deployer forensics — scan a wallet's full contract deployment history
+    across chains and detect serial rug pull patterns.
+    """
+    from cli.deployer_cmd import deployer_command
+    config = load_config()
+    if not validate_keys(config): raise typer.Exit(1)
+    deployer_command(
+        address        = address,
+        config         = config,
+        chains         = list(chain) if chain else None,
+        model_override = get_model_id(model) if model else None,
+        no_stream      = no_stream,
+        output_json    = json_out,
+    )
+
+
+# ── wallet ────────────────────────────────────────────────────────────────────
+@app.command()
+def wallet(
+    address:  str  = typer.Argument(..., help="Wallet address to analyse (0x...)"),
+    chain:    str  = typer.Option("eth", "--chain", "-c",
+                                  help=f"Chain: {', '.join(CHAINS.keys())}"),
+    model:    str  = typer.Option(None,  "--model", "-m"),
+    json_out: bool = typer.Option(False, "--json"),
+):
+    """
+    Wallet tracker — fetch all token holdings and audit each contract.
+    Shows portfolio-level risk score and grade.
+
+    Example:
+      dexai wallet 0xYourAddress --chain eth
+    """
+    from cli.wallet_cmd import wallet_command
+    config    = load_config()
+    chain_key = resolve_chain(chain)
+    if chain_key not in CHAINS:
+        console.print(f"[red]Unknown chain '{chain}'[/red]")
+        raise typer.Exit(1)
+    if not validate_keys(config): raise typer.Exit(1)
+    if model:
+        config["openrouter"]["model"] = get_model_id(model)
+    wallet_command(
+        address  = address,
+        chain    = chain_key,
+        config   = config,
+        json_out = json_out,
+    )
+
+
+# ── scan (batch) ──────────────────────────────────────────────────────────────
+@app.command()
+def scan(
+    addresses: list[str] = typer.Argument(..., help="Multiple contract addresses"),
+    chain:     str       = typer.Option("eth",  "--chain", "-c"),
+    model:     str       = typer.Option(None,   "--model", "-m"),
+    json_out:  bool      = typer.Option(False,  "--json"),
+):
+    """Batch audit multiple contracts at once."""
+    import asyncio, json as _json
+    from core.session import run_audit
+    from report.renderer import render_audit, render_error
+
+    config    = load_config()
+    chain_key = resolve_chain(chain)
+    if not validate_keys(config): raise typer.Exit(1)
+    if model: config["openrouter"]["model"] = get_model_id(model)
+
+    async def _batch():
+        for addr in addresses:
+            console.rule(f"[cyan]{addr}[/cyan]")
+            try:
+                _, result = await run_audit(addr, chain_key, config, stream=False)
+                if json_out:
+                    console.print_json(_json.dumps(result))
+                else:
+                    render_audit(result, addr, chain_key)
+            except Exception as e:
+                render_error(str(e))
+    asyncio.run(_batch())
+
+
+# ── activate ──────────────────────────────────────────────────────────────────
+@app.command()
+def activate(
+    license_key: str = typer.Argument(..., help="License key from purchase email"),
+):
+    """Activate DexAI with your license key."""
+    from core.license import activate as _activate, get_device_id, LICENSE_FILE
+    console.print(f"\n  Device ID: [cyan]{get_device_id()}[/cyan]")
+    if _activate(license_key):
+        console.print(
+            f"[bold green]✓ License activated![/bold green]\n"
+            f"  Stored: {LICENSE_FILE}\n"
+        )
+    else:
+        console.print("[bold red]✗ Invalid license key.[/bold red]")
+        raise typer.Exit(1)
+
+
+# ── device-id ─────────────────────────────────────────────────────────────────
+@app.command("device-id")
+def device_id_cmd():
+    """Show your device ID for purchasing or support."""
+    from core.license import get_device_id
+    console.print(f"\n  Device ID: [bold cyan]{get_device_id()}[/bold cyan]\n")
+
+
+# ── version ───────────────────────────────────────────────────────────────────
+@app.command()
+def version():
+    """Show DexAI version."""
+    console.print("[bold cyan]DexAI[/bold cyan] v1.0.0")
+    console.print("Audit · Deployer Forensics · Wallet Tracker · Portfolio Monitor")
+
+
+if __name__ == "__main__":
+    app()
+===== ./fetchers/etherscan.py =====
+"""
+Etherscan V2 API fetcher.
+Single API key → all EVM chains via ?chainid=<id>
+Base URL: https://api.etherscan.io/v2/api
+"""
+import json
+import asyncio
+import httpx
+from utils.rate_limiter import etherscan_limiter
+
+BASE = "https://api.etherscan.io/v2/api"
+
+
+async def _get(params: dict, api_key: str) -> dict:
+    """Throttled GET wrapper."""
+    await etherscan_limiter.acquire()
+    params["apikey"] = api_key
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(BASE, params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+async def get_source_code(address: str, chain_id: int, api_key: str) -> dict:
+    data = await _get(
+        {"chainid": chain_id, "module": "contract",
+         "action": "getsourcecode", "address": address},
+        api_key,
+    )
+    if data.get("status") != "1" or not data.get("result"):
+        return {"verified": False, "source": "", "abi": "[]",
+                "compiler": "", "proxy": False, "implementation": "",
+                "constructor_args": "", "license": "None"}
+    r = data["result"][0]
+    return {
+        "verified":          bool(r.get("SourceCode")),
+        "source":            r.get("SourceCode", ""),
+        "abi":               r.get("ABI", "[]"),
+        "compiler":          r.get("CompilerVersion", ""),
+        "proxy":             r.get("Proxy", "0") == "1",
+        "implementation":    r.get("Implementation", ""),
+        "constructor_args":  r.get("ConstructorArguments", ""),
+        "license":           r.get("LicenseType", "None"),
+    }
+
+
+async def get_token_info(address: str, chain_id: int, api_key: str) -> dict:
+    data = await _get(
+        {"chainid": chain_id, "module": "token",
+         "action": "tokeninfo", "contractaddress": address},
+        api_key,
+    )
+    if data.get("status") != "1":
+        return {}
+    result = data.get("result", [{}])
+    return result[0] if isinstance(result, list) and result else {}
+
+
+async def get_contract_creation(address: str, chain_id: int, api_key: str) -> dict:
+    data = await _get(
+        {"chainid": chain_id, "module": "contract",
+         "action": "getcontractcreation", "contractaddresses": address},
+        api_key,
+    )
+    if data.get("status") != "1":
+        return {}
+    result = data.get("result", [{}])
+    return result[0] if isinstance(result, list) and result else {}
+
+
+async def get_top_holders(address: str, chain_id: int, api_key: str) -> list:
+    """PRO endpoint — returns [] gracefully if not available."""
+    data = await _get(
+        {"chainid": chain_id, "module": "token",
+         "action": "tokenholderlist", "contractaddress": address,
+         "page": 1, "offset": 10},
+        api_key,
+    )
+    if data.get("status") != "1":
+        return []
+    return data.get("result", [])
+
+
+async def fetch_all(address: str, chain_id: int, api_key: str) -> dict:
+    """Fetch all contract data concurrently."""
+    if not api_key:
+        return {
+            "verified": False, "source": "", "abi": "[]",
+            "compiler": "", "proxy": False, "implementation": "",
+            "license": "None", "constructor_args": "",
+            "token_name": "", "token_symbol": "", "total_supply": "",
+            "holders": "", "creator": "", "tx_hash": "", "top_holders": [],
+        }
+
+    source_t   = get_source_code(address, chain_id, api_key)
+    token_t    = get_token_info(address, chain_id, api_key)
+    creation_t = get_contract_creation(address, chain_id, api_key)
+    holders_t  = get_top_holders(address, chain_id, api_key)
+
+    source, token, creation, holders = await asyncio.gather(
+        source_t, token_t, creation_t, holders_t,
+        return_exceptions=True,
+    )
+
+    def safe(val, default):
+        return default if isinstance(val, Exception) else val
+
+    source   = safe(source, {})
+    token    = safe(token, {})
+    creation = safe(creation, {})
+    holders  = safe(holders, [])
+
+    return {
+        **source,
+        "token_name":    token.get("tokenName", ""),
+        "token_symbol":  token.get("symbol", ""),
+        "total_supply":  token.get("totalSupply", ""),
+        "holders":       token.get("holdersCount", ""),
+        "creator":       creation.get("contractCreator", ""),
+        "tx_hash":       creation.get("txHash", ""),
+        "top_holders":   holders if isinstance(holders, list) else [],
+    }
+===== ./fetchers/__init__.py =====
+===== ./fetchers/wallet.py =====
+# fetchers/wallet.py
+"""
+Wallet token holding fetcher.
+Uses Etherscan V2 tokentx endpoint to discover current ERC-20 holdings.
+"""
+import asyncio
+from collections import defaultdict
+import httpx
+
+from utils.rate_limiter import RateLimiter
+
+wallet_limiter = RateLimiter(calls_per_second=3)
+BASE = "https://api.etherscan.io/v2/api"
+
+
+async def _get(params: dict, api_key: str, client: httpx.AsyncClient) -> dict:
+    await wallet_limiter.acquire()
+    params["apikey"] = api_key
+    try:
+        r = await client.get(BASE, params=params, timeout=25)
+        return r.json()
+    except Exception:
+        return {"status": "0", "result": []}
+
+
+async def get_native_balance(
+    wallet: str, chain_id: int, api_key: str, client: httpx.AsyncClient
+) -> str:
+    """Return native balance in wei as string."""
+    data = await _get(
+        {"chainid": chain_id, "module": "account",
+         "action": "balance", "address": wallet, "tag": "latest"},
+        api_key, client,
+    )
+    return data.get("result", "0") if data.get("status") == "1" else "0"
+
+
+async def get_token_transfers(
+    wallet: str, chain_id: int, api_key: str, client: httpx.AsyncClient,
+    limit: int = 500,
+) -> list[dict]:
+    """Fetch all ERC-20 token transfer events for a wallet."""
+    data = await _get(
+        {"chainid": chain_id, "module": "account",
+         "action": "tokentx", "address": wallet,
+         "startblock": 0, "endblock": 99999999,
+         "page": 1, "offset": limit, "sort": "desc"},
+        api_key, client,
+    )
+    if data.get("status") == "1":
+        return data.get("result", [])
+    return []
+
+
+def _compute_holdings(wallet: str, transfers: list[dict]) -> list[dict]:
+    """
+    Compute current token holdings by summing inbound - outbound transfers.
+    Returns list of tokens where net balance > 0.
+    """
+    wallet_lc = wallet.lower()
+    balances: dict[str, dict] = {}     # contractAddress → metadata
+    net: dict[str, int] = defaultdict(int)
+
+    for tx in transfers:
+        contract = tx.get("contractAddress", "").lower()
+        if not contract:
+            continue
+
+        # Store metadata from the most recent tx for this token
+        if contract not in balances:
+            balances[contract] = {
+                "contract_address": contract,
+                "token_name":       tx.get("tokenName", ""),
+                "token_symbol":     tx.get("tokenSymbol", ""),
+                "decimals":         int(tx.get("tokenDecimal", "18") or "18"),
+            }
+
+        value = int(tx.get("value", "0") or "0")
+        if tx.get("to", "").lower() == wallet_lc:
+            net[contract] += value    # received
+        elif tx.get("from", "").lower() == wallet_lc:
+            net[contract] -= value    # sent
+
+    holdings = []
+    for contract, meta in balances.items():
+        balance_raw = net[contract]
+        if balance_raw <= 0:
+            continue                  # no longer holding
+        decimals = meta["decimals"]
+        balance  = balance_raw / (10 ** decimals)
+        holdings.append({
+            **meta,
+            "balance_raw": balance_raw,
+            "balance":     round(balance, 6),
+        })
+
+    return sorted(holdings, key=lambda x: x["balance_raw"], reverse=True)
+
+
+async def fetch_wallet_holdings(
+    wallet: str,
+    chain_id: int,
+    chain_key: str,
+    api_key: str,
+) -> dict:
+    """
+    Fetch all current ERC-20 holdings + native balance for a wallet.
+    Returns full wallet snapshot.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        transfers_task = get_token_transfers(wallet, chain_id, api_key, client)
+        balance_task   = get_native_balance(wallet, chain_id, api_key, client)
+
+        transfers, native_raw = await asyncio.gather(
+            transfers_task, balance_task, return_exceptions=True
+        )
+
+    if isinstance(transfers, Exception):
+        transfers = []
+    if isinstance(native_raw, Exception):
+        native_raw = "0"
+
+    holdings = _compute_holdings(wallet, transfers)
+
+    native_balance = int(native_raw) / 1e18
+
+    return {
+        "wallet":         wallet.lower(),
+        "chain":          chain_key,
+        "chain_id":       chain_id,
+        "native_balance": round(native_balance, 6),
+        "token_count":    len(holdings),
+        "holdings":       holdings,
+        "transfer_count": len(transfers),
+    }
+===== ./fetchers/deployer.py =====
+# fetchers/deployer.py
+"""
+Deployer Forensics Fetcher
+===========================
+Given a wallet address, finds ALL contracts it has deployed
+across every supported chain using Etherscan V2's single API key.
+
+Key insight: contract creation txs have an empty `to` field.
+The resulting contract address is in `contractAddress` field.
+"""
+import asyncio
+from datetime import datetime, timezone
+import httpx
+
+from core.chains import CHAINS
+from utils.rate_limiter import RateLimiter
+
+# Separate limiter for deployer (more concurrent calls needed)
+deployer_limiter = RateLimiter(calls_per_second=3)
+BASE = "https://api.etherscan.io/v2/api"
+
+
+# ── Fetch tx list for one chain ───────────────────────────────────────────────
+
+async def _fetch_txlist(
+    address: str,
+    chain_id: int,
+    api_key: str,
+    client: httpx.AsyncClient,
+) -> list[dict]:
+    """Fetch last 200 txs from an address on one chain."""
+    await deployer_limiter.acquire()
+    params = {
+        "chainid":   chain_id,
+        "module":    "account",
+        "action":    "txlist",
+        "address":   address,
+        "startblock": 0,
+        "endblock":  99999999,
+        "page":      1,
+        "offset":    200,          # last 200 txs per chain
+        "sort":      "desc",
+        "apikey":    api_key,
+    }
+    try:
+        r = await client.get(BASE, params=params, timeout=20)
+        data = r.json()
+        if data.get("status") == "1":
+            return data.get("result", [])
+    except Exception:
+        pass
+    return []
+
+
+# ── Extract contract deployments from tx list ─────────────────────────────────
+
+def _extract_deployments(txs: list[dict], chain_key: str) -> list[dict]:
+    """
+    Filter txs where `to` is empty = contract creation.
+    Returns a list of deployed contract summaries.
+    """
+    deployments = []
+    for tx in txs:
+        # Contract creation: 'to' is empty string, contractAddress is set
+        if tx.get("to", "").strip() == "" and tx.get("contractAddress"):
+            ts = int(tx.get("timeStamp", 0))
+            deployments.append({
+                "contract_address": tx["contractAddress"].lower(),
+                "tx_hash":          tx.get("hash", ""),
+                "block":            int(tx.get("blockNumber", 0)),
+                "timestamp":        ts,
+                "date":             datetime.fromtimestamp(ts, tz=timezone.utc)
+                                    .strftime("%Y-%m-%d %H:%M UTC")
+                                    if ts else "unknown",
+                "chain":            chain_key,
+                "chain_id":         CHAINS[chain_key]["id"],
+                "gas_used":         tx.get("gasUsed", "0"),
+                "is_error":         tx.get("isError", "0") == "1",
+            })
+    return deployments
+
+
+# ── Fetch contract metadata for each deployment ───────────────────────────────
+
+async def _enrich_contract(
+    deployment: dict,
+    api_key: str,
+    client: httpx.AsyncClient,
+) -> dict:
+    """Add token name, symbol, verified status to a deployment record."""
+    await deployer_limiter.acquire()
+    address  = deployment["contract_address"]
+    chain_id = deployment["chain_id"]
+
+    # Get source code (tells us: verified, name, compiler)
+    params = {
+        "chainid": chain_id,
+        "module":  "contract",
+        "action":  "getsourcecode",
+        "address": address,
+        "apikey":  api_key,
+    }
+    try:
+        r = await client.get(BASE, params=params, timeout=20)
+        data = r.json()
+        if data.get("status") == "1" and data.get("result"):
+            res = data["result"][0]
+            deployment["verified"]      = bool(res.get("SourceCode", "").strip())
+            deployment["contract_name"] = res.get("ContractName", "")
+            deployment["compiler"]      = res.get("CompilerVersion", "")
+            deployment["license"]       = res.get("LicenseType", "None")
+            deployment["proxy"]         = res.get("Proxy", "0") == "1"
+        else:
+            deployment["verified"]      = False
+            deployment["contract_name"] = ""
+    except Exception:
+        deployment["verified"]      = False
+        deployment["contract_name"] = ""
+
+    # Get token info (name, symbol, holders)
+    await deployer_limiter.acquire()
+    params2 = {
+        "chainid":          chain_id,
+        "module":           "token",
+        "action":           "tokeninfo",
+        "contractaddress":  address,
+        "apikey":           api_key,
+    }
+    try:
+        r2 = await client.get(BASE, params=params2, timeout=15)
+        d2 = r2.json()
+        if d2.get("status") == "1" and d2.get("result"):
+            ti = d2["result"][0] if isinstance(d2["result"], list) else d2["result"]
+            deployment["token_name"]    = ti.get("tokenName", "")
+            deployment["token_symbol"]  = ti.get("symbol", "")
+            deployment["total_supply"]  = ti.get("totalSupply", "")
+            deployment["holder_count"]  = ti.get("holdersCount", "0")
+        else:
+            deployment["token_name"]   = ""
+            deployment["token_symbol"] = ""
+            deployment["holder_count"] = "0"
+    except Exception:
+        deployment["token_name"]   = ""
+        deployment["token_symbol"] = ""
+        deployment["holder_count"] = "0"
+
+    return deployment
+
+
+# ── Fetch funder (first inbound tx = who funded this deployer) ────────────────
+
+async def _fetch_funder(
+    deployer: str,
+    api_key: str,
+    client: httpx.AsyncClient,
+) -> dict:
+    """
+    Find the wallet that first funded this deployer — critical for
+    linking deployers that reuse a common funder to hide identity.
+    """
+    await deployer_limiter.acquire()
+    params = {
+        "chainid":    1,              # Check ETH mainnet for funding source
+        "module":     "account",
+        "action":     "txlist",
+        "address":    deployer,
+        "startblock": 0,
+        "endblock":   99999999,
+        "page":       1,
+        "offset":     50,
+        "sort":       "asc",          # Oldest first
+        "apikey":     api_key,
+    }
+    try:
+        r = await client.get(BASE, params=params, timeout=20)
+        data = r.json()
+        if data.get("status") == "1" and data.get("result"):
+            for tx in data["result"]:
+                # First inbound tx = funder
+                if tx.get("to", "").lower() == deployer.lower():
+                    return {
+                        "funder_address": tx.get("from", ""),
+                        "funding_tx":     tx.get("hash", ""),
+                        "funding_date":   datetime.fromtimestamp(
+                            int(tx.get("timeStamp", 0)), tz=timezone.utc
+                        ).strftime("%Y-%m-%d"),
+                        "funding_value_eth": str(
+                            int(tx.get("value", "0")) / 1e18
+                        )[:8],
+                    }
+    except Exception:
+        pass
+    return {"funder_address": "unknown", "funding_tx": "", "funding_date": ""}
+
+
+# ── Main: scan all chains concurrently ───────────────────────────────────────
+
+async def fetch_deployer_profile(
+    deployer: str,
+    api_key: str,
+    chains_to_scan: list[str] | None = None,
+    enrich: bool = True,
+) -> dict:
+    """
+    Full deployer forensics profile.
+
+    Returns:
+    {
+      "deployer": "0x...",
+      "total_deployments": 14,
+      "chains_active": ["eth", "bsc", "base"],
+      "funder": {...},
+      "deployments": [
+        {
+          "contract_address": "0x...",
+          "chain": "bsc",
+          "date": "2024-03-15",
+          "token_name": "SafeMoon2",
+          "token_symbol": "SAFEMOON2",
+          "verified": false,
+          "holder_count": "12",
+          ...
+        }
+      ],
+      "risk_signals": {
+        "multi_chain_deployer": true,
+        "has_unverified_contracts": true,
+        "rapid_deployments": true,       # >3 contracts in 30 days
+        "low_holder_contracts": 8,       # contracts with <50 holders
+      }
+    }
+    """
+    if chains_to_scan is None:
+        # Default: the 5 most popular rug chains
+        chains_to_scan = ["eth", "bsc", "polygon", "base", "arb"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 1. Fetch tx lists from all chains in parallel
+        tx_tasks = {
+            chain: _fetch_txlist(
+                deployer, CHAINS[chain]["id"], api_key, client
+            )
+            for chain in chains_to_scan
+            if chain in CHAINS
+        }
+        tx_results = {}
+        for chain, task in tx_tasks.items():
+            tx_results[chain] = await task
+
+        # 2. Extract deployments from each chain
+        all_deployments: list[dict] = []
+        for chain, txs in tx_results.items():
+            all_deployments.extend(_extract_deployments(txs, chain))
+
+        # Sort newest first
+        all_deployments.sort(key=lambda x: x["timestamp"], reverse=True)
+
+        # 3. Enrich with contract metadata (cap at 20 to stay within rate limits)
+        if enrich and all_deployments:
+            enrich_tasks = [
+                _enrich_contract(d, api_key, client)
+                for d in all_deployments[:20]
+            ]
+            enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+            for i, result in enumerate(enriched):
+                if not isinstance(result, Exception):
+                    all_deployments[i] = result
+
+        # 4. Fetch funder info
+        funder = await _fetch_funder(deployer, api_key, client)
+
+    # 5. Compute risk signals
+    chains_active = list({d["chain"] for d in all_deployments})
+    unverified    = [d for d in all_deployments if not d.get("verified", True)]
+    low_holders   = [
+        d for d in all_deployments
+        if int(d.get("holder_count", "0") or "0") < 50
+    ]
+
+    # Rapid deployment: >3 contracts in any 30-day window
+    rapid = False
+    if len(all_deployments) >= 3:
+        timestamps = sorted([d["timestamp"] for d in all_deployments], reverse=True)
+        for i in range(len(timestamps) - 2):
+            if timestamps[i] - timestamps[i + 2] < 30 * 86400:
+                rapid = True
+                break
+
+    return {
+        "deployer":           deployer.lower(),
+        "total_deployments":  len(all_deployments),
+        "chains_active":      chains_active,
+        "chains_scanned":     chains_to_scan,
+        "funder":             funder,
+        "deployments":        all_deployments,
+        "risk_signals": {
+            "multi_chain_deployer":       len(chains_active) > 1,
+            "has_unverified_contracts":   len(unverified) > 0,
+            "unverified_count":           len(unverified),
+            "rapid_deployments":          rapid,
+            "low_holder_contracts":       len(low_holders),
+            "total_contracts":            len(all_deployments),
+        },
+    }
+===== ./analysis/goplus_check.py =====
+# analysis/goplus_check.py
+"""
+Layer 2: GoPlus Security API cross-reference.
+Free, no API key required for basic checks.
+Used as GROUND TRUTH for honeypot detection — binary, always accurate.
+Endpoint: https://api.gopluslabs.io/api/v1/token_security/{chain_id}
+"""
+import httpx
+from utils.rate_limiter import RateLimiter
+
+goplus_limiter = RateLimiter(calls_per_second=2)
+
+GOPLUS_CHAIN_IDS = {
+    "eth": "1", "bsc": "56", "polygon": "137",
+    "arb": "42161", "base": "8453", "op": "10",
+    "avax": "43114", "fantom": "250",
+}
+
+GOPLUS_BASE = "https://api.gopluslabs.io/api/v1/token_security"
+
+
+async def fetch_goplus(address: str, chain: str) -> dict:
+    """
+    Fetch GoPlus token security data.
+    Returns raw GoPlus result dict, or empty dict on failure.
+    """
+    chain_id = GOPLUS_CHAIN_IDS.get(chain.lower())
+    if not chain_id:
+        return {}
+
+    await goplus_limiter.acquire()
+    url = f"{GOPLUS_BASE}/{chain_id}"
+    params = {"contract_addresses": address.lower()}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, params=params)
+            data = r.json()
+
+        if data.get("code") != 1:
+            return {}
+
+        result = data.get("result", {})
+        token_data = result.get(address.lower(), {})
+        return token_data
+    except Exception:
+        return {}
+
+
+def parse_goplus(raw: dict) -> dict:
+    """
+    Parse GoPlus response into a clean, standardised dict.
+    Maps GoPlus field names → DexAI field names.
+    GoPlus uses "1" for true, "0" for false.
+    """
+    if not raw:
+        return {"goplus_available": False}
+
+    def _bool(key: str) -> bool | None:
+        v = raw.get(key)
+        if v is None:
+            return None
+        return str(v) == "1"
+
+    def _float(key: str) -> float | None:
+        v = raw.get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "goplus_available":       True,
+        # Core honeypot / scam signals
+        "gp_is_honeypot":         _bool("is_honeypot"),
+        "gp_is_open_source":      _bool("is_open_source"),
+        "gp_is_proxy":            _bool("is_proxy"),
+        "gp_is_mintable":         _bool("is_mintable"),
+        "gp_owner_change_balance":_bool("owner_change_balance"),
+        "gp_can_be_minted":       _bool("can_be_minted"),
+        "gp_owner_address":       raw.get("owner_address", ""),
+        "gp_creator_address":     raw.get("creator_address", ""),
+        "gp_selfdestruct":        _bool("selfdestruct"),
+        "gp_external_call":       _bool("external_call"),
+        "gp_buy_tax":             _float("buy_tax"),
+        "gp_sell_tax":            _float("sell_tax"),
+        "gp_cannot_sell_all":     _bool("cannot_sell_all"),
+        "gp_cannot_buy":          _bool("cannot_buy"),
+        "gp_trading_cooldown":    _bool("trading_cooldown"),
+        "gp_transfer_pausable":   _bool("transfer_pausable"),
+        "gp_is_blacklisted":      _bool("is_blacklisted"),
+        "gp_is_whitelisted":      _bool("is_whitelisted"),
+        "gp_is_anti_whale":       _bool("is_anti_whale"),
+        "gp_anti_whale_modifiable": _bool("anti_whale_modifiable"),
+        "gp_slippage_modifiable": _bool("slippage_modifiable"),
+        "gp_hidden_owner":        _bool("hidden_owner"),
+        "gp_take_back_ownership": _bool("take_back_ownership"),
+        "gp_owner_percent":       _float("owner_percent"),
+        "gp_creator_percent":     _float("creator_percent"),
+        "gp_holder_count":        raw.get("holder_count", ""),
+        "gp_lp_holder_count":     raw.get("lp_holder_count", ""),
+        "gp_total_supply":        raw.get("total_supply", ""),
+        "gp_token_name":          raw.get("token_name", ""),
+        "gp_token_symbol":        raw.get("token_symbol", ""),
+        "gp_dex":                 raw.get("dex", []),
+    }
+
+
+def goplus_risk_signals(parsed: dict) -> list[dict]:
+    """
+    Convert GoPlus data into standardised risk signals
+    that can be merged with static + AI findings.
+    """
+    if not parsed.get("goplus_available"):
+        return []
+
+    signals = []
+
+    def _flag(condition, severity, title, desc):
+        if condition:
+            signals.append({"severity": severity, "title": title,
+                            "description": desc, "source": "goplus"})
+
+    _flag(parsed.get("gp_is_honeypot"),
+          "CRITICAL", "GoPlus: Confirmed Honeypot",
+          "GoPlus Security API confirms this token is a honeypot — "
+          "you can buy but cannot sell.")
+
+    _flag(parsed.get("gp_hidden_owner"),
+          "CRITICAL", "GoPlus: Hidden Owner",
+          "Contract has a hidden owner that can regain ownership at any time.")
+
+    _flag(parsed.get("gp_take_back_ownership"),
+          "CRITICAL", "GoPlus: Owner Can Reclaim Control",
+          "Renounced ownership can be taken back by the original owner.")
+
+    _flag(parsed.get("gp_cannot_sell_all"),
+          "HIGH", "GoPlus: Cannot Sell All Tokens",
+          "Sell restrictions detected — holders cannot sell 100% of their tokens.")
+
+    _flag(parsed.get("gp_selfdestruct"),
+          "HIGH", "GoPlus: Selfdestruct Present",
+          "Contract contains a selfdestruct function.")
+
+    buy_tax  = parsed.get("gp_buy_tax")  or 0
+    sell_tax = parsed.get("gp_sell_tax") or 0
+
+    if sell_tax and float(sell_tax) > 0.10:
+        signals.append({
+            "severity": "HIGH" if float(sell_tax) > 0.25 else "MEDIUM",
+            "title": f"GoPlus: High Sell Tax ({float(sell_tax)*100:.0f}%)",
+            "description": f"Sell tax is {float(sell_tax)*100:.0f}%. Trades are heavily penalised.",
+            "source": "goplus",
+        })
+
+    owner_pct = parsed.get("gp_owner_percent") or 0
+    if owner_pct and float(owner_pct) > 0.05:
+        signals.append({
+            "severity": "HIGH" if float(owner_pct) > 0.20 else "MEDIUM",
+            "title": f"GoPlus: Owner Holds {float(owner_pct)*100:.1f}%",
+            "description": "Owner holds a large % of supply — dump risk.",
+            "source": "goplus",
+        })
+
+    return signals
+===== ./analysis/schema.py =====
+# analysis/schema.py
+"""
+Layer 3: Pydantic schema validation for all AI responses.
+Every AI output is validated — malformed JSON triggers automatic retry.
+Inconsistent fields are corrected against ground truth from static + GoPlus.
+"""
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import Optional
+
+
+class AuditFinding(BaseModel):
+    severity:    str
+    title:       str
+    description: str
+    code_ref:    Optional[str] = None
+
+    @field_validator("severity")
+    @classmethod
+    def validate_severity(cls, v):
+        allowed = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+        return v.upper() if v.upper() in allowed else "INFO"
+
+
+class AuditResult(BaseModel):
+    risk_score:               float = Field(..., ge=0.0, le=10.0)
+    recommendation:           str   = "CAUTION"
+    honeypot:                 bool  = False
+    mint_function:            bool  = False
+    owner_renounced:          bool  = False
+    proxy_pattern:            bool  = False
+    hidden_owner:             bool  = False
+    transfer_tax_modifiable:  bool  = False
+    blacklist_function:       bool  = False
+    max_tx_limit:             bool  = False
+    liquidity_concerns:       bool  = False
+    findings:                 list[AuditFinding] = []
+    positive_signals:         list[str]          = []
+    summary:                  str  = ""
+    audit_cost_equivalent:    str  = "$8,000-$20,000"
+
+    @field_validator("recommendation")
+    @classmethod
+    def validate_rec(cls, v):
+        allowed = {"SAFE", "CAUTION", "AVOID"}
+        return v.upper() if v.upper() in allowed else "CAUTION"
+
+    @model_validator(mode="before")
+    @classmethod
+    def pre_clamp(cls, data: dict) -> dict:
+        """Clamp risk_score BEFORE field validation (Field ge/le)."""
+        if isinstance(data, dict) and "risk_score" in data:
+            try:
+                data["risk_score"] = round(max(0.0, min(10.0, float(data["risk_score"]))), 1)
+            except (TypeError, ValueError):
+                data["risk_score"] = 5.0
+        return data
+
+    @model_validator(mode="after")
+    def consistency_check(self):
+        """Auto-correct obvious internal inconsistencies."""
+        # If honeypot=True, score must be at least 8.0
+        if self.honeypot and self.risk_score < 8.0:
+            self.risk_score = max(self.risk_score, 8.0)
+        # Recommendation must match score
+        if self.risk_score >= 7.0 and self.recommendation == "SAFE":
+            self.recommendation = "AVOID"
+        if self.risk_score <= 3.0 and self.recommendation == "AVOID":
+            self.recommendation = "CAUTION"
+        return self
+
+
+class DeployerResult(BaseModel):
+    risk_score:              float = Field(..., ge=0.0, le=10.0)
+    verdict:                 str   = "SUSPICIOUS"
+    pattern:                 str   = ""
+    findings:                list[AuditFinding] = []
+    chain_hopping:           bool  = False
+    identity_obfuscation:    bool  = False
+    reuse_pattern:           bool  = False
+    estimated_victims:       Optional[int] = None
+    total_contracts_deployed:int   = 0
+    red_flags:               list[str] = []
+    summary:                 str  = ""
+    recommendation:          str  = "CAUTION"
+
+    @field_validator("verdict")
+    @classmethod
+    def validate_verdict(cls, v):
+        allowed = {"CLEAN", "SUSPICIOUS", "KNOWN_RUGGER", "SERIAL_RUGGER"}
+        return v.upper() if v.upper() in allowed else "SUSPICIOUS"
+
+    @field_validator("recommendation")
+    @classmethod
+    def validate_rec(cls, v):
+        allowed = {"TRUST", "CAUTION", "AVOID", "BLACKLIST"}
+        return v.upper() if v.upper() in allowed else "CAUTION"
+
+
+class MonitorResult(BaseModel):
+    alert:       bool = False
+    alert_level: str  = "NONE"
+    changes:     list[str] = []
+    new_risk_score: float = 0.0
+    old_risk_score: float = 0.0
+    message:     str  = ""
+    action:      str  = "NONE"
+
+    @field_validator("alert_level")
+    @classmethod
+    def validate_level(cls, v):
+        return v.upper() if v.upper() in {"NONE","INFO","WARNING","CRITICAL"} else "NONE"
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, v):
+        return v.upper() if v.upper() in {"NONE","REVIEW","SELL_IMMEDIATELY"} else "NONE"
+
+
+def validate_audit(raw: dict) -> AuditResult:
+    return AuditResult.model_validate(raw)
+
+def validate_deployer(raw: dict) -> DeployerResult:
+    return DeployerResult.model_validate(raw)
+
+def validate_monitor(raw: dict) -> MonitorResult:
+    return MonitorResult.model_validate(raw)
+===== ./analysis/consensus.py =====
+# analysis/consensus.py
+"""
+Layer 4: Dual-model consensus engine.
+Research shows single models have ~10% hallucination rate and
+inconsistent results. Two models must agree within 2.0 points.
+Disagreement triggers a third model as tiebreaker.
+
+Flow:
+  1. Run Model A (primary, e.g. deepseek-r1)
+  2. Run Model B (secondary, e.g. gemini-flash)
+  3. Compare scores
+     ├─ Agree (diff < 2.0) → average score, merge findings
+     └─ Disagree → run Model C (tiebreaker, e.g. claude-sonnet)
+                   → use median of all three scores
+"""
+import json
+import asyncio
+from ai.client import OpenRouterClient
+from analysis.schema import validate_audit, AuditResult
+
+# Model pairs for consensus
+CONSENSUS_PAIRS = [
+    ("deepseek/deepseek-r1",                "google/gemini-flash-2.0"),
+    ("google/gemini-flash-2.0",             "meta-llama/llama-3.3-70b-instruct:free"),
+]
+TIEBREAKER_MODEL = "anthropic/claude-sonnet-4-5"
+AGREEMENT_THRESHOLD = 2.0   # score diff above this = disagreement
+
+
+async def _run_single(
+    messages: list[dict],
+    model: str,
+    api_key: str,
+    max_tokens: int = 4000,
+) -> dict:
+    """Run one model and return validated result dict."""
+    client = OpenRouterClient(
+        api_key=api_key, model=model,
+        max_tokens=max_tokens, temperature=0.1,
+    )
+    raw = await client.complete(messages)
+    return raw
+
+
+async def run_consensus_audit(
+    messages: list[dict],
+    config: dict,
+    static_result: dict | None = None,
+    goplus_result: dict | None = None,
+) -> tuple[dict, dict]:
+    """
+    Run dual-model consensus audit.
+
+    Returns: (final_result_dict, metadata_dict)
+    metadata includes: models_used, agreement, confidence_boost
+    """
+    api_key = config["openrouter"]["api_key"]
+
+    # Pick model pair based on config
+    # Use primary model + a cheap secondary for consensus
+    primary_model   = config["openrouter"]["model"]
+    secondary_model = "google/gemini-flash-2.0"
+    # Don't run consensus with same model twice
+    if primary_model == secondary_model:
+        secondary_model = "deepseek/deepseek-r1"
+
+    # Run both models concurrently
+    result_a_raw, result_b_raw = await asyncio.gather(
+        _run_single(messages, primary_model, api_key),
+        _run_single(messages, secondary_model, api_key),
+        return_exceptions=True,
+    )
+
+    # Handle errors gracefully
+    if isinstance(result_a_raw, Exception):
+        result_a_raw = {}
+    if isinstance(result_b_raw, Exception):
+        result_b_raw = {}
+
+    # Validate both
+    try:
+        result_a = validate_audit(result_a_raw)
+        score_a  = result_a.risk_score
+    except Exception:
+        result_a = None
+        score_a  = None
+
+    try:
+        result_b = validate_audit(result_b_raw)
+        score_b  = result_b.risk_score
+    except Exception:
+        result_b = None
+        score_b  = None
+
+    # If only one worked, use it
+    if result_a is None and result_b is not None:
+        final = result_b
+        meta = {"models_used": [secondary_model], "agreement": None,
+                "consensus": False, "confidence": "MEDIUM"}
+    elif result_b is None and result_a is not None:
+        final = result_a
+        meta = {"models_used": [primary_model], "agreement": None,
+                "consensus": False, "confidence": "MEDIUM"}
+    elif result_a is None and result_b is None:
+        # Both failed — return minimal safe result
+        return (
+            {"risk_score": 5.0, "recommendation": "CAUTION",
+             "summary": "Analysis unavailable — API error.",
+             "findings": [], "honeypot": False, "mint_function": False,
+             "owner_renounced": False, "proxy_pattern": False,
+             "hidden_owner": False, "transfer_tax_modifiable": False,
+             "blacklist_function": False, "max_tx_limit": False,
+             "liquidity_concerns": False, "positive_signals": [],
+             "audit_cost_equivalent": "$8,000-$20,000"},
+            {"models_used": [], "agreement": None,
+             "consensus": False, "confidence": "VERY_LOW"},
+        )
+    else:
+        diff = abs(score_a - score_b)
+
+        if diff <= AGREEMENT_THRESHOLD:
+            # Models agree — use average score, merge findings
+            avg_score = round((score_a + score_b) / 2, 1)
+            merged    = _merge_results(result_a, result_b, avg_score)
+            final     = merged
+            meta = {
+                "models_used":  [primary_model, secondary_model],
+                "score_a":      score_a,
+                "score_b":      score_b,
+                "agreement":    round(diff, 2),
+                "consensus":    True,
+                "confidence":   "HIGH",
+            }
+        else:
+            # Disagreement — run tiebreaker
+            result_c_raw = await _run_single(
+                messages, TIEBREAKER_MODEL, api_key, max_tokens=4000
+            )
+            try:
+                result_c = validate_audit(result_c_raw)
+                score_c  = result_c.risk_score
+            except Exception:
+                result_c = result_a   # fallback
+                score_c  = score_a
+
+            # Median of three scores
+            scores    = sorted([score_a, score_b, score_c])
+            med_score = scores[1]
+            # Use the result closest to median
+            dists     = [abs(score_a - med_score), abs(score_b - med_score),
+                         abs(score_c - med_score)]
+            closest   = [result_a, result_b, result_c][dists.index(min(dists))]
+            final     = closest
+            final.risk_score = round(med_score, 1)
+
+            meta = {
+                "models_used":  [primary_model, secondary_model, TIEBREAKER_MODEL],
+                "score_a":      score_a,
+                "score_b":      score_b,
+                "score_c":      score_c,
+                "agreement":    round(diff, 2),
+                "consensus":    False,
+                "tiebreaker":   True,
+                "confidence":   "MEDIUM",
+            }
+
+    # Apply ground truth overrides from static analysis + GoPlus
+    final_dict = final.model_dump()
+    final_dict = _apply_ground_truth(final_dict, static_result, goplus_result)
+    final_dict["_meta"] = meta
+
+    return final_dict, meta
+
+
+def _merge_results(a: AuditResult, b: AuditResult, avg_score: float) -> AuditResult:
+    """Merge two agreeing audit results. Union findings, average score."""
+    seen_titles = set()
+    merged_findings = []
+    for f in (a.findings + b.findings):
+        if f.title not in seen_titles:
+            seen_titles.add(f.title)
+            merged_findings.append(f)
+
+    # Union positive signals
+    pos = list(set(a.positive_signals + b.positive_signals))
+
+    # Take the more conservative recommendation
+    rec_priority = {"AVOID": 3, "CAUTION": 2, "SAFE": 1}
+    rec = a.recommendation if rec_priority.get(a.recommendation, 0) >= \
+          rec_priority.get(b.recommendation, 0) else b.recommendation
+
+    # Union boolean flags (OR — if either model found it, flag it)
+    return AuditResult(
+        risk_score               = avg_score,
+        recommendation           = rec,
+        honeypot                 = a.honeypot or b.honeypot,
+        mint_function            = a.mint_function or b.mint_function,
+        owner_renounced          = a.owner_renounced and b.owner_renounced,
+        proxy_pattern            = a.proxy_pattern or b.proxy_pattern,
+        hidden_owner             = a.hidden_owner or b.hidden_owner,
+        transfer_tax_modifiable  = a.transfer_tax_modifiable or b.transfer_tax_modifiable,
+        blacklist_function       = a.blacklist_function or b.blacklist_function,
+        max_tx_limit             = a.max_tx_limit or b.max_tx_limit,
+        liquidity_concerns       = a.liquidity_concerns or b.liquidity_concerns,
+        findings                 = merged_findings,
+        positive_signals         = pos,
+        summary                  = a.summary,   # primary model's summary
+        audit_cost_equivalent    = "$8,000-$20,000",
+    )
+
+
+def _apply_ground_truth(
+    result: dict,
+    static: dict | None,
+    goplus: dict | None,
+) -> dict:
+    """
+    Override AI flags with deterministic ground truth.
+    Static analysis and GoPlus are binary and always correct.
+    AI can change boolean flags but ground truth takes precedence.
+    """
+    if static:
+        sc = static.get("static_checks", {})
+        # Override AI boolean flags with static truth
+        if sc.get("has_mint_function"):
+            result["mint_function"] = True
+        if sc.get("has_blacklist"):
+            result["blacklist_function"] = True
+        if sc.get("has_selfdestruct"):
+            # Selfdestruct is always critical — force score up
+            result["risk_score"] = max(result["risk_score"], 8.0)
+        if sc.get("has_proxy_pattern"):
+            result["proxy_pattern"] = True
+
+        # Merge static findings (dedup by title)
+        existing_titles = {f["title"] for f in result.get("findings", [])}
+        for sf in static.get("static_findings", []):
+            if sf["title"] not in existing_titles:
+                result.setdefault("findings", []).append(sf)
+                existing_titles.add(sf["title"])
+
+        # Blend static risk score (30% static, 70% AI)
+        static_score = static.get("static_risk_score", 0)
+        result["risk_score"] = round(
+            result["risk_score"] * 0.70 + static_score * 0.30, 1
+        )
+        result["risk_score"] = min(10.0, max(0.0, result["risk_score"]))
+
+    if goplus:
+        # GoPlus honeypot is ground truth — always override
+        if goplus.get("gp_is_honeypot") is True:
+            result["honeypot"]    = True
+            result["risk_score"]  = max(result["risk_score"], 9.0)
+            result["recommendation"] = "AVOID"
+
+        if goplus.get("gp_hidden_owner") is True:
+            result["hidden_owner"] = True
+            result["risk_score"]   = max(result["risk_score"], 7.5)
+
+        if goplus.get("gp_is_mintable") is True:
+            result["mint_function"] = True
+
+        if goplus.get("gp_transfer_pausable") is True:
+            result["blacklist_function"] = True
+
+        # Merge GoPlus signals
+        from analysis.goplus_check import goplus_risk_signals
+        gp_signals = goplus_risk_signals(goplus)
+        existing_titles = {f.get("title","") for f in result.get("findings", [])}
+        for sig in gp_signals:
+            if sig["title"] not in existing_titles:
+                result.setdefault("findings", []).append(sig)
+
+        result["goplus_data"] = {
+            k: v for k, v in goplus.items()
+            if k.startswith("gp_")
+        }
+
+    # Final consistency check
+    if result["risk_score"] >= 7.0 and result["recommendation"] == "SAFE":
+        result["recommendation"] = "AVOID"
+    if result["risk_score"] <= 2.5 and result["recommendation"] == "AVOID":
+        result["recommendation"] = "CAUTION"
+
+    return result
+===== ./analysis/retry.py =====
+# analysis/retry.py
+"""
+Retry + validation wrapper for all AI calls.
+Handles: malformed JSON, schema errors, empty responses, API timeouts.
+Max 3 attempts with exponential backoff.
+"""
+import json
+import asyncio
+from pydantic import ValidationError
+from ai.client import OpenRouterClient
+from analysis.schema import validate_audit, validate_deployer, validate_monitor
+
+
+MAX_RETRIES   = 3
+BASE_DELAY    = 2.0    # seconds
+BACKOFF_MULT  = 2.0
+
+
+class AIResponseError(Exception):
+    """Raised when all retries are exhausted."""
+    pass
+
+
+async def call_with_retry(
+    messages: list[dict],
+    config: dict,
+    validator_fn,
+    model_override: str | None = None,
+    max_tokens: int = 4000,
+) -> dict:
+    """
+    Call OpenRouter and validate response. Auto-retry on failure.
+    validator_fn: one of validate_audit, validate_deployer, validate_monitor
+    """
+    model  = model_override or config["openrouter"]["model"]
+    api_key = config["openrouter"]["api_key"]
+    client = OpenRouterClient(
+        api_key=api_key, model=model,
+        max_tokens=max_tokens, temperature=0.1,
+    )
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw = await client.complete(messages)
+
+            if not raw:
+                raise ValueError("Empty response from AI")
+
+            # Validate schema — raises ValidationError if wrong
+            validated = validator_fn(raw)
+            return validated.model_dump()
+
+        except (json.JSONDecodeError, KeyError) as e:
+            last_error = f"JSON parse error: {e}"
+        except ValidationError as e:
+            last_error = f"Schema validation failed: {e.error_count()} errors"
+            # Add correction instruction to messages on retry
+            if attempt < MAX_RETRIES:
+                messages = messages + [{
+                    "role": "assistant",
+                    "content": str(raw) if "raw" in dir() else "{}",
+                }, {
+                    "role": "user",
+                    "content": (
+                        f"Your previous response had schema errors: {last_error}. "
+                        "Please try again and return ONLY valid JSON matching "
+                        "the exact schema specified in the system prompt."
+                    ),
+                }]
+        except Exception as e:
+            last_error = f"API error: {type(e).__name__}: {e}"
+
+        if attempt < MAX_RETRIES:
+            delay = BASE_DELAY * (BACKOFF_MULT ** (attempt - 1))
+            await asyncio.sleep(delay)
+
+    raise AIResponseError(
+        f"All {MAX_RETRIES} attempts failed. Last error: {last_error}"
+    )
+
+
+async def safe_audit(messages: list[dict], config: dict, **kwargs) -> dict:
+    """Audit with retry + schema validation. Returns fallback on total failure."""
+    try:
+        return await call_with_retry(messages, config, validate_audit, **kwargs)
+    except AIResponseError:
+        return _fallback_audit()
+
+
+async def safe_deployer(messages: list[dict], config: dict, **kwargs) -> dict:
+    """Deployer analysis with retry. Returns fallback on total failure."""
+    try:
+        return await call_with_retry(messages, config, validate_deployer, **kwargs)
+    except AIResponseError:
+        return _fallback_deployer()
+
+
+async def safe_monitor(messages: list[dict], config: dict, **kwargs) -> dict:
+    try:
+        return await call_with_retry(messages, config, validate_monitor,
+                                     max_tokens=600, **kwargs)
+    except AIResponseError:
+        return {"alert": False, "alert_level": "NONE",
+                "message": "Analysis failed", "changes": [],
+                "new_risk_score": 0.0, "old_risk_score": 0.0, "action": "NONE"}
+
+
+def _fallback_audit() -> dict:
+    """Safe fallback when AI is completely unavailable."""
+    return {
+        "risk_score": 5.0,
+        "recommendation": "CAUTION",
+        "honeypot": False, "mint_function": False, "owner_renounced": False,
+        "proxy_pattern": False, "hidden_owner": False,
+        "transfer_tax_modifiable": False, "blacklist_function": False,
+        "max_tx_limit": False, "liquidity_concerns": False,
+        "findings": [{
+            "severity": "INFO",
+            "title": "Analysis Unavailable",
+            "description": "AI analysis could not be completed. "
+                           "Check your OpenRouter API key and try again.",
+        }],
+        "positive_signals": [],
+        "summary": "AI analysis failed. Static analysis results shown only. "
+                   "Manual review recommended before investing.",
+        "audit_cost_equivalent": "$8,000-$20,000",
+        "_fallback": True,
+    }
+
+
+def _fallback_deployer() -> dict:
+    return {
+        "risk_score": 5.0, "verdict": "SUSPICIOUS",
+        "recommendation": "CAUTION", "pattern": "Analysis unavailable",
+        "findings": [], "red_flags": [],
+        "chain_hopping": False, "identity_obfuscation": False,
+        "reuse_pattern": False, "estimated_victims": None,
+        "total_contracts_deployed": 0,
+        "summary": "Deployer analysis failed. Manual review recommended.",
+        "_fallback": True,
+    }
+===== ./analysis/__init__.py =====
+===== ./analysis/static_checks.py =====
+# analysis/static_checks.py
+"""
+Layer 1: Deterministic static analysis.
+Runs BEFORE the AI — catches known patterns with 100% consistency.
+No hallucinations. No inconsistency. Always the same result.
+"""
+import re
+from dataclasses import dataclass, field
+
+
+@dataclass
+class StaticFinding:
+    severity:   str
+    title:      str
+    description:str
+    pattern:    str
+    confidence: str = "HIGH"
+
+
+@dataclass
+class StaticResult:
+    has_mint_function:         bool = False
+    has_blacklist:             bool = False
+    has_max_tx_limit:          bool = False
+    has_fee_modification:      bool = False
+    has_selfdestruct:          bool = False
+    has_delegatecall:          bool = False
+    has_reentrancy_risk:       bool = False
+    has_tx_origin:             bool = False
+    has_emergency_withdraw:    bool = False
+    has_pausable:              bool = False
+    has_proxy_pattern:         bool = False
+    has_unchecked_transfer:    bool = False
+    has_integer_overflow_risk: bool = False
+    uses_openzeppelin:         bool = False
+    has_timelock:              bool = False
+    owner_renounced_pattern:   bool = False
+    findings: list = field(default_factory=list)
+    static_risk_score: float = 0.0
+    confidence: str = "HIGH"
+
+
+PATTERNS = {
+    "mint": (
+        re.compile(r"function\s+mint\s*\([^)]*\).*?(?:external|public)", re.DOTALL|re.IGNORECASE),
+        "CRITICAL","Mint Function Detected",
+        "Contract has a mint function. Owner can create unlimited tokens and dilute supply.",
+    ),
+    "blacklist": (
+        re.compile(r"(?:blacklist|blocklist|banned|isBlocked|_blacklisted)\s*[\[\(]", re.IGNORECASE),
+        "HIGH","Blacklist Function Detected",
+        "Contract can blacklist addresses, preventing selling — a classic honeypot mechanism.",
+    ),
+    "max_tx": (
+        re.compile(r"(?:maxTxAmount|_maxTxAmount|maxTransactionAmount|maxTx)\s*[=;]", re.IGNORECASE),
+        "MEDIUM","Max Transaction Limit",
+        "Transfer amounts capped. Owner may lower this to prevent large sell orders.",
+    ),
+    "fee_mod": (
+        re.compile(r"function\s+set(?:Fee|Tax|Rate|BuyFee|SellFee|BuyTax|SellTax)\s*\([^)]*\)", re.IGNORECASE),
+        "HIGH","Modifiable Transfer Tax",
+        "Owner can change fees after deployment — can be set to 100% to trap funds.",
+    ),
+    "selfdestruct": (
+        re.compile(r"\bselfdestruct\b|\bsuicide\b", re.IGNORECASE),
+        "CRITICAL","Self-Destruct Function",
+        "Contract can self-destruct, destroying all state and retrieving ETH.",
+    ),
+    "delegatecall": (
+        re.compile(r"\bdelegatecall\b", re.IGNORECASE),
+        "HIGH","Delegatecall Usage",
+        "Delegatecall allows arbitrary code execution in contract context if not guarded.",
+    ),
+    "reentrancy": (
+        re.compile(r"\.call\{value\s*:.*?\}\(|\.call\.value\(", re.IGNORECASE),
+        "HIGH","Potential Reentrancy",
+        "Low-level .call with value — verify state updates before external calls.",
+    ),
+    "tx_origin": (
+        re.compile(r"\btx\.origin\b", re.IGNORECASE),
+        "MEDIUM","tx.origin Authentication",
+        "tx.origin auth is phishing-vulnerable. Use msg.sender instead.",
+    ),
+    "emergency_withdraw": (
+        re.compile(r"function\s+(?:emergencyWithdraw|withdrawAll|drain|rescue)\s*\([^)]*\)", re.IGNORECASE),
+        "HIGH","Emergency Withdraw",
+        "Owner can withdraw all funds from the contract.",
+    ),
+    "pausable": (
+        re.compile(r"\bPausable\b|\b_paused\b|\bwhenNotPaused\b", re.IGNORECASE),
+        "MEDIUM","Pausable Contract",
+        "Owner can pause all transfers — can prevent selling.",
+    ),
+    "proxy": (
+        re.compile(r"(?:TransparentUpgradeableProxy|UUPSUpgradeable|ERC1967Proxy|_implementation\(\))", re.IGNORECASE),
+        "MEDIUM","Upgradeable Proxy",
+        "Contract is upgradeable — owner can replace code post-deployment.",
+    ),
+    "unchecked_transfer": (
+        re.compile(r"\.transfer\(|\.send\(", re.IGNORECASE),
+        "LOW","Unchecked Transfer",
+        "Use SafeERC20 instead of .transfer() or .send().",
+    ),
+    "overflow": (
+        re.compile(r"pragma solidity\s+\^?0\.[0-7]\.", re.IGNORECASE),
+        "MEDIUM","Old Solidity — Overflow Risk",
+        "Solidity < 0.8.0 lacks built-in overflow protection — SafeMath required.",
+    ),
+    "openzeppelin": (
+        re.compile(r"@openzeppelin|openzeppelin/contracts", re.IGNORECASE),
+        "INFO","Uses OpenZeppelin",
+        "Imports from OpenZeppelin — well-audited library, positive signal.",
+    ),
+    "timelock": (
+        re.compile(r"\bTimelockController\b|\btimelock\b", re.IGNORECASE),
+        "INFO","Timelock Present",
+        "Admin actions are time-locked — strong positive governance signal.",
+    ),
+    "renounce": (
+        re.compile(r"renounceOwnership\(\)", re.IGNORECASE),
+        "INFO","Renounce Ownership Present",
+        "Contract can renounce ownership. Verify on-chain if it has been called.",
+    ),
+}
+
+SCORE_WEIGHTS = {
+    "CRITICAL": 3.0, "HIGH": 1.5, "MEDIUM": 0.7,
+    "LOW": 0.2,      "INFO": -0.3,
+}
+
+FLAG_MAP = {
+    "mint": "has_mint_function", "blacklist": "has_blacklist",
+    "max_tx": "has_max_tx_limit", "fee_mod": "has_fee_modification",
+    "selfdestruct": "has_selfdestruct", "delegatecall": "has_delegatecall",
+    "reentrancy": "has_reentrancy_risk", "tx_origin": "has_tx_origin",
+    "emergency_withdraw": "has_emergency_withdraw", "pausable": "has_pausable",
+    "proxy": "has_proxy_pattern", "unchecked_transfer": "has_unchecked_transfer",
+    "overflow": "has_integer_overflow_risk", "openzeppelin": "uses_openzeppelin",
+    "timelock": "has_timelock", "renounce": "owner_renounced_pattern",
+}
+
+
+def run_static_checks(source: str) -> StaticResult:
+    result = StaticResult()
+    if not source or not source.strip():
+        result.confidence = "LOW"
+        return result
+
+    score = 0.0
+    for key, (pattern, severity, title, description) in PATTERNS.items():
+        if pattern.search(source):
+            result.findings.append(StaticFinding(severity, title, description, key))
+            score += SCORE_WEIGHTS.get(severity, 0)
+            attr = FLAG_MAP.get(key)
+            if attr:
+                setattr(result, attr, True)
+
+    result.static_risk_score = min(10.0, max(0.0, score * 1.2))
+    return result
+
+
+def static_to_dict(r: StaticResult) -> dict:
+    return {
+        "static_checks": {
+            k: getattr(r, k) for k in FLAG_MAP.values()
+        },
+        "static_risk_score": round(r.static_risk_score, 2),
+        "static_findings": [
+            {"severity": f.severity, "title": f.title,
+             "description": f.description, "source": "static_analysis"}
+            for f in r.findings
+        ],
+        "static_confidence": r.confidence,
+    }
+===== ./seller_workflow.py =====
+#!/usr/bin/env python3
+"""
+DexAI — Automated Seller Webhook Handler
+==========================================
+Deploy this on a cheap VPS or Vercel serverless function.
+When a buyer purchases on Whop/Gumroad, it:
+  1. Receives the webhook with buyer device_id
+  2. Signs the device_id with your private key
+  3. Returns the license key (Whop emails it automatically)
+
+For Whop: set your webhook URL in the Whop seller dashboard.
+For Gumroad: use Gumroad's ping webhook → Zapier → this endpoint.
+
+Environment variables required:
+  DEXAI_PRIVATE_KEY_PATH  → path to keys/private.pem
+  DEXAI_WEBHOOK_SECRET    → your webhook signing secret
+
+Run locally for testing:
+  DEXAI_PRIVATE_KEY_PATH=keys/private.pem python seller_workflow.py
+"""
+import os
+import sys
+import hmac
+import hashlib
+import json
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from core.license import sign_license, get_device_id
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+PRIVATE_KEY_PATH = os.environ.get("DEXAI_PRIVATE_KEY_PATH", "keys/private.pem")
+WEBHOOK_SECRET   = os.environ.get("DEXAI_WEBHOOK_SECRET", "changeme")
+
+
+def load_private_key() -> str:
+    path = Path(PRIVATE_KEY_PATH)
+    if not path.exists():
+        raise FileNotFoundError(f"Private key not found: {path}")
+    return path.read_text()
+
+
+def generate_license_for_device(device_id: str) -> str:
+    """Core function — takes a device_id, returns a license key."""
+    priv_pem = load_private_key()
+    return sign_license(device_id, priv_pem)
+
+
+# ── Simple HTTP handler (use with Flask or raw http.server) ───────────────────
+def handle_whop_webhook(payload: dict) -> dict:
+    """
+    Whop sends a webhook when a purchase is completed.
+    Buyer must include their device_id in the checkout notes
+    OR you collect it via a post-purchase form.
+
+    Expected payload:
+    {
+      "event": "purchase.completed",
+      "data": {
+        "buyer_email": "...",
+        "product_id":  "...",
+        "metadata": {
+          "device_id": "abc123def456789a"
+        }
+      }
+    }
+    """
+    event = payload.get("event", "")
+    if event != "purchase.completed":
+        return {"status": "ignored", "event": event}
+
+    device_id = (
+        payload.get("data", {})
+               .get("metadata", {})
+               .get("device_id", "")
+    )
+    if not device_id or len(device_id) != 16:
+        return {
+            "status": "error",
+            "message": "device_id missing or invalid. "
+                       "Buyer must run: dexai device-id"
+        }
+
+    license_key = generate_license_for_device(device_id)
+    return {
+        "status":      "ok",
+        "device_id":   device_id,
+        "license_key": license_key,
+        "message":     f"Run: dexai activate {license_key}",
+    }
+
+
+# ── CLI usage ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        device_id   = sys.argv[1]
+        license_key = generate_license_for_device(device_id)
+        print(f"\nDevice ID:   {device_id}")
+        print(f"License Key: {license_key}")
+        print(f"\nSend buyer:  dexai activate {license_key}\n")
+    else:
+        # Self-test with this machine's device ID
+        my_id  = get_device_id()
+        my_key = generate_license_for_device(my_id)
+        print(f"\n[SELF TEST]")
+        print(f"Device ID:   {my_id}")
+        print(f"License Key: {my_key}")
+        print(f"\nTest activation:")
+        print(f"  DEXAI_DEV=0 python main.py activate {my_key}")
+        print()
