@@ -14,6 +14,9 @@ LICENSE_FILE = CONFIG_DIR / "license.key"
 
 console = Console()
 
+# List of supported chains for RPC configuration
+RPC_CHAINS = ["eth", "bsc", "polygon", "arb", "base", "op", "avax", "fantom", "zksync", "gnosis"]
+
 DEFAULT_CONFIG: dict = {
     "openrouter": {
         "api_key":     "",
@@ -24,6 +27,7 @@ DEFAULT_CONFIG: dict = {
     },
     "explorers": {
         "etherscan": "",
+        "infura": "",   # Legacy, can be used as fallback for RPC
     },
     "preferences": {
         "default_chain":  "eth",
@@ -44,6 +48,9 @@ DEFAULT_CONFIG: dict = {
             "from_number":      "",
             "to_number":        "",
         },
+    },
+    "rpc": {
+        chain: "" for chain in RPC_CHAINS
     },
 }
 
@@ -121,12 +128,12 @@ def run_setup_wizard() -> dict:
     console.print("[bold cyan]  Aegis — First Time Setup[/bold cyan]")
     console.print("[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]\n")
 
-    console.print("[bold]Step 1/4 — OpenRouter API Key[/bold]")
+    console.print("[bold]Step 1/5 — OpenRouter API Key[/bold]")
     console.print("  Get one free at openrouter.ai\n")
     or_key = Prompt.ask("  Enter your OpenRouter API key", password=True)
     config["openrouter"]["api_key"] = or_key.strip()
 
-    console.print("\n[bold]Step 2/4 — Default AI Model[/bold]\n")
+    console.print("\n[bold]Step 2/5 — Default AI Model[/bold]\n")
     for i, (k, m) in enumerate(MODELS.items(), 1):
         cost = "FREE" if m["cost_in"] == 0 else f"${m['cost_in']:.2f}/${m['cost_out']:.2f}/1M tok"
         console.print(f"  [cyan]{i}[/cyan]. [bold]{m['label']}[/bold]  [dim]{cost}[/dim]")
@@ -140,7 +147,7 @@ def run_setup_wizard() -> dict:
     config["openrouter"]["model_key"] = chosen_key
     console.print(f"\n  [green]✓ {MODELS[chosen_key]['label']} selected[/green]")
 
-    console.print("\n[bold]Step 3/4 — Etherscan V2 API Key[/bold]")
+    console.print("\n[bold]Step 3/5 — Etherscan V2 API Key[/bold]")
     console.print("  One key = ETH + BSC + Polygon + Base + Arb + 50 more chains")
     console.print("  Get one free at etherscan.io/apis\n")
     eth_key = Prompt.ask("  Enter Etherscan key (Enter to skip)", default="")
@@ -150,7 +157,20 @@ def run_setup_wizard() -> dict:
     else:
         console.print("  [yellow]⚠ Skipped[/yellow]")
 
-    console.print("\n[bold]Step 4/4 — Notifications (optional)[/bold]")
+    console.print("\n[bold]Step 4/5 — RPC Endpoints (for deep analysis)[/bold]")
+    console.print("  Mythril (symbolic execution) needs an RPC endpoint for each chain.")
+    console.print("  You can use public endpoints or your own (e.g., Infura, Alchemy).\n")
+    set_rpc = Prompt.ask("  Set custom RPC endpoints now?", choices=["y","n"], default="n")
+    if set_rpc == "y":
+        for chain in RPC_CHAINS:
+            rpc_val = Prompt.ask(f"    RPC URL for {chain.upper()} (Enter to skip)", default="")
+            if rpc_val.strip():
+                config["rpc"][chain] = rpc_val.strip()
+        console.print("  [green]✓ RPC endpoints configured[/green]")
+    else:
+        console.print("  [dim]Skipped. You can set later with: aegis config set rpc.eth <URL>[/dim]")
+
+    console.print("\n[bold]Step 5/5 — Notifications (optional)[/bold]")
     console.print("  You can configure Telegram or WhatsApp alerts for the watchlist monitor.")
     console.print("  You can skip this now and set later with:\n")
     console.print("    aegis config set notifications.telegram.enabled true")

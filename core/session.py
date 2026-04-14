@@ -10,10 +10,10 @@ from ai.prompt_builder import build_audit_prompt, build_qa_prompt
 from utils.cache import get_cached, set_cached
 from utils.validators import is_valid_address
 
-# Slither integration (Python API, multi‑file support)
+# Slither integration (source‑based, local files)
 from analysis.slither_integration import run_slither_on_source
 
-# Optional advanced analysis modules
+# Optional advanced analysis modules (static checks, GoPlus, consensus, retry)
 try:
     from analysis.static_checks import run_static_checks, static_to_dict
     from analysis.goplus_check import fetch_goplus, parse_goplus
@@ -46,7 +46,7 @@ async def run_audit(
     chain = get_chain(chain_name)
     api_key = config["explorers"].get("etherscan", "")
 
-    # ── Check if address is a contract (using improved is_contract) ──
+    # ── Check if address is a contract ──────────────────────────────
     if api_key:
         if not await is_contract(address, chain["id"], api_key):
             raise ValueError(
@@ -74,16 +74,16 @@ async def run_audit(
         source_flattened = raw_source
         source_dict = None
 
-    # ── Run Slither on multi‑file source (if available) ────────────────
+    # Use flattened source for static checks and AI prompt
+    source = source_flattened
+
+    # ── Run Slither on local source code ────────────────────────────────
     slither_findings = []
     if source_dict:
         slither_findings = run_slither_on_source(source_dict, debug=debug)
     elif raw_source:
         slither_findings = run_slither_on_source(raw_source, debug=debug)
-    contract["slither_findings"] = slither_findings   # store for later use
-
-    # Use flattened source for static checks and AI prompt
-    source = source_flattened
+    contract["slither_findings"] = slither_findings
 
     # ── Advanced analysis (static, GoPlus, consensus) or simple AI ────
     if ADVANCED_ANALYSIS and not stream:
@@ -122,8 +122,7 @@ async def run_audit(
             json_mode=True,
         )
         if stream:
-            # For streaming, Slither findings are attached to contract
-            # and will be merged in cli/audit.py after JSON parsing
+            # For streaming, findings are attached to contract
             return contract, client.stream_audit(messages)
         else:
             result = await client.complete(messages)
@@ -141,8 +140,6 @@ async def run_qa(
 ) -> AsyncGenerator:
     """
     Follow‑up Q&A – ensures deployer address is present and uses natural language output.
-    The contract dictionary (from cache) includes slither_findings.
-    The audit_result also includes slither_findings as a fallback.
     """
     chain = get_chain(chain_name)
     contract = get_cached(address, chain["key"]) or {}
@@ -161,10 +158,8 @@ async def run_qa(
         except Exception:
             pass
 
-    # Build Q&A prompt – it will extract slither_findings from contract (or audit_result)
     messages = build_qa_prompt(contract, history, question, audit_result=audit_result)
 
-    # Create client with JSON mode OFF – Q&A should return natural language
     client = OpenRouterClient(
         api_key=config["openrouter"]["api_key"],
         model=config["openrouter"]["model"],
