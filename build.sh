@@ -50,6 +50,16 @@ if grep -q "REPLACETHIS" core/license.py; then
 fi
 ok "Public key found"
 
+# ── Check API keys are set ────────────────────────────────────────────────────
+info "Checking built-in API keys..."
+if grep -q '_OPENROUTER_ENC = ""' core/api_keys.py; then
+    error "OpenRouter API key not set in core/api_keys.py\n  Run: python -c \"from core.api_keys import obfuscate; print(obfuscate('YOUR_KEY'))\"\n  Then paste the result into _OPENROUTER_ENC"
+fi
+if grep -q '_ETHERSCAN_ENC  = ""' core/api_keys.py; then
+    error "Etherscan API key not set in core/api_keys.py\n  Run: python -c \"from core.api_keys import obfuscate; print(obfuscate('YOUR_KEY'))\"\n  Then paste the result into _ETHERSCAN_ENC"
+fi
+ok "API keys configured"
+
 # ── Install dependencies ──────────────────────────────────────────────────────
 info "Installing dependencies..."
 pip install \

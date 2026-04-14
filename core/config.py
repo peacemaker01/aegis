@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from ai.models import MODELS, DEFAULT_MODEL_KEY
+from core.api_keys import get_openrouter_key, get_etherscan_key
 
 CONFIG_DIR   = Path.home() / ".aegis"
 CONFIG_FILE  = CONFIG_DIR / "config.json"
@@ -55,16 +56,31 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+def _inject_baked_keys(config: dict) -> dict:
+    """Inject built-in API keys when user hasn't provided their own."""
+    if not config["openrouter"]["api_key"]:
+        baked = get_openrouter_key()
+        if baked:
+            config["openrouter"]["api_key"] = baked
+    if not config["explorers"]["etherscan"]:
+        baked = get_etherscan_key()
+        if baked:
+            config["explorers"]["etherscan"] = baked
+    return config
+
+
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        return run_setup_wizard()
-    try:
-        with open(CONFIG_FILE) as f:
-            data = json.load(f)
-        return _deep_merge(DEFAULT_CONFIG, data)
-    except (json.JSONDecodeError, OSError) as e:
-        console.print(f"[red]Config error: {e}[/red]")
-        sys.exit(1)
+        config = run_setup_wizard()
+    else:
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+            config = _deep_merge(DEFAULT_CONFIG, data)
+        except (json.JSONDecodeError, OSError) as e:
+            console.print(f"[red]Config error: {e}[/red]")
+            sys.exit(1)
+    return _inject_baked_keys(config)
 
 
 def save_config(config: dict) -> None:
@@ -107,18 +123,11 @@ def set_value(key: str, value: str) -> None:
 
 
 def validate_keys(config: dict) -> bool:
-    ok = True
+    """Check that required API keys are available (built-in or user-provided)."""
     if not config["openrouter"]["api_key"]:
-        console.print(
-            "[red]✗ OpenRouter API key missing.[/red]\n"
-            "  Run: [bold]aegis config set openrouter.api_key YOUR_KEY[/bold]"
-        )
-        ok = False
-    if not config["explorers"]["etherscan"]:
-        console.print(
-            "[yellow]⚠ No Etherscan key — limited data available.[/yellow]"
-        )
-    return ok
+        console.print("[red]✗ AI service unavailable — contact support.[/red]")
+        return False
+    return True
 
 
 def run_setup_wizard() -> dict:
@@ -128,12 +137,7 @@ def run_setup_wizard() -> dict:
     console.print("[bold cyan]  Aegis — First Time Setup[/bold cyan]")
     console.print("[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]\n")
 
-    console.print("[bold]Step 1/5 — OpenRouter API Key[/bold]")
-    console.print("  Get one free at openrouter.ai\n")
-    or_key = Prompt.ask("  Enter your OpenRouter API key", password=True)
-    config["openrouter"]["api_key"] = or_key.strip()
-
-    console.print("\n[bold]Step 2/5 — Default AI Model[/bold]\n")
+    console.print("[bold]Step 1/3 — Default AI Model[/bold]\n")
     for i, (k, m) in enumerate(MODELS.items(), 1):
         cost = "FREE" if m["cost_in"] == 0 else f"${m['cost_in']:.2f}/${m['cost_out']:.2f}/1M tok"
         console.print(f"  [cyan]{i}[/cyan]. [bold]{m['label']}[/bold]  [dim]{cost}[/dim]")
@@ -147,18 +151,8 @@ def run_setup_wizard() -> dict:
     config["openrouter"]["model_key"] = chosen_key
     console.print(f"\n  [green]✓ {MODELS[chosen_key]['label']} selected[/green]")
 
-    console.print("\n[bold]Step 3/5 — Etherscan V2 API Key[/bold]")
-    console.print("  One key = ETH + BSC + Polygon + Base + Arb + 50 more chains")
-    console.print("  Get one free at etherscan.io/apis\n")
-    eth_key = Prompt.ask("  Enter Etherscan key (Enter to skip)", default="")
-    if eth_key.strip():
-        config["explorers"]["etherscan"] = eth_key.strip()
-        console.print("  [green]✓ Saved[/green]")
-    else:
-        console.print("  [yellow]⚠ Skipped[/yellow]")
-
-    console.print("\n[bold]Step 4/5 — RPC Endpoints (for deep analysis)[/bold]")
-    console.print("  Mythril (symbolic execution) needs an RPC endpoint for each chain.")
+    console.print("\n[bold]Step 2/3 — RPC Endpoints (optional)[/bold]")
+    console.print("  Custom RPC endpoints enable deep analysis with Mythril.")
     console.print("  You can use public endpoints or your own (e.g., Infura, Alchemy).\n")
     set_rpc = Prompt.ask("  Set custom RPC endpoints now?", choices=["y","n"], default="n")
     if set_rpc == "y":
@@ -170,7 +164,7 @@ def run_setup_wizard() -> dict:
     else:
         console.print("  [dim]Skipped. You can set later with: aegis config set rpc.eth <URL>[/dim]")
 
-    console.print("\n[bold]Step 5/5 — Notifications (optional)[/bold]")
+    console.print("\n[bold]Step 3/3 — Notifications (optional)[/bold]")
     console.print("  You can configure Telegram or WhatsApp alerts for the watchlist monitor.")
     console.print("  You can skip this now and set later with:\n")
     console.print("    aegis config set notifications.telegram.enabled true")
