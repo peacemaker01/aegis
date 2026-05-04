@@ -1468,16 +1468,14 @@ async def main() -> None:
     logger.info("Starting Aegis Telegram Bot…"); await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-def run_telegram_bot():
-    """Run the Telegram bot polling loop."""
-    asyncio.run(main())
+def run_fastapi():
+    """Run the FastAPI health endpoint in a daemon thread."""
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
-    # Start the Telegram bot in a background daemon thread
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
-
-    # Run FastAPI on the Render‑provided PORT
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    # Start FastAPI in a daemon thread so it binds to PORT immediately
+    threading.Thread(target=run_fastapi, daemon=True).start()
+    # Run the Telegram bot in the main thread (no asyncio.run in sub-thread)
+    asyncio.run(main())
