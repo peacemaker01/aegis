@@ -1,0 +1,16 @@
+Metadata-Version: 2.1
+Name: wasm
+Version: 1.2
+Summary: WebAssembly decoder & disassembler
+Home-page: https://github.com/athre0z/wasm
+Author: Joel Höner
+Author-email: athre0z@zyantific.com
+License: MIT
+Download-URL: https://github.com/athre0z/wasm/archive/v1.2.tar.gz
+Keywords: wasm,disassembler,decoder
+Platform: UNKNOWN
+Requires-Dist: setuptools
+
+UNKNOWN
+
+

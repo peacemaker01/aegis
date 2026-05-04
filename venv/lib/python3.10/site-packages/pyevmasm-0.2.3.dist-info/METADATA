@@ -1,0 +1,19 @@
+Metadata-Version: 2.1
+Name: pyevmasm
+Version: 0.2.3
+Summary: Ethereum Virtual Machine (EVM) assembler and disassembler
+Home-page: https://github.com/trailofbits/pyevmasm
+Author: Trail of Bits
+Author-email: evmasm@trailofbits.com
+License: Apache License 2.0
+Platform: UNKNOWN
+Requires-Python: >2.7
+Requires-Dist: future
+Provides-Extra: dev
+Requires-Dist: nose ; extra == 'dev'
+Requires-Dist: coverage ; extra == 'dev'
+Requires-Dist: flake8 ; extra == 'dev'
+
+UNKNOWN
+
+

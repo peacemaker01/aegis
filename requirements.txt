@@ -1,5 +1,31 @@
-httpx==0.27.0
+# Core
+httpx>=0.27.0                    # was httpx==0.27.0
 typer==0.12.3
 rich==13.7.1
 cryptography==42.0.5
+python-telegram-bot>=20.0
+python-dotenv>=1.0.1
+
+# Solana integration (upgraded to resolve httpx conflict)
+solana>=0.36.0                   # was solana==0.30.2
+solders>=0.18.0
+base58>=2.1.0
+
+# Database
+aiosqlite>=0.19.0
+
+# Slither
 slither-analyzer
+
+# Webhook & API
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+
+# Task queue + Caching
+redis>=5.2.1
+# Moralis (whale tracking / streams)
+
+# Additional utilities
+pydantic-settings==2.3.0
+fpdf2>=2.8.0

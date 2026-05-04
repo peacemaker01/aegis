@@ -6,28 +6,54 @@ Base URL: https://api.etherscan.io/v2/api
 import json
 import asyncio
 import httpx
+from typing import Optional, List
 from utils.rate_limiter import etherscan_limiter
+from utils.api_key_pool import ApiKeyPool
 
 BASE = "https://api.etherscan.io/v2/api"
+_etherscan_pool: Optional[ApiKeyPool] = None
+ETHERSCAN_DEBUG = False
+
+
+def init_etherscan_pool(keys: List[str], calls_per_second: float = 5.0):
+    """Initialize the Etherscan API key pool."""
+    global _etherscan_pool
+    if keys:
+        _etherscan_pool = ApiKeyPool(keys, calls_per_second)
 
 
 async def _get(params: dict, api_key: str) -> dict:
-    """Throttled GET wrapper."""
+    """Throttled GET wrapper using key pool if available."""
+    if ETHERSCAN_DEBUG:
+        print(f"[DEBUG] Etherscan request: {params}")
     await etherscan_limiter.acquire()
-    params["apikey"] = api_key
+    
+    if _etherscan_pool:
+        key = await _etherscan_pool.acquire()
+    else:
+        key = api_key
+    
+    params["apikey"] = key
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(BASE, params=params)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = await client.get(BASE, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") == "0" and "rate limit" in data.get("result", "").lower():
+                if _etherscan_pool:
+                    _etherscan_pool.report_failure(key, rate_limited=True)
+                raise Exception("Rate limited")
+            if _etherscan_pool:
+                _etherscan_pool.report_success(key)
+            return data
+        except Exception as e:
+            if _etherscan_pool:
+                _etherscan_pool.report_failure(key)
+            raise e
 
 
 async def is_contract(address: str, chain_id: int, api_key: str) -> bool:
-    """
-    Determine if an address is a smart contract.
-    Uses multiple methods for reliability.
-    Returns True if contract, False otherwise.
-    """
-    # Method 1: Check bytecode
+    """Determine if an address is a smart contract."""
     params = {
         "chainid": chain_id,
         "module": "account",
@@ -44,7 +70,6 @@ async def is_contract(address: str, chain_id: int, api_key: str) -> bool:
     except Exception:
         pass
 
-    # Method 2: Check if source code is verified (strong indicator)
     try:
         src = await get_source_code(address, chain_id, api_key)
         if src.get("verified"):
@@ -52,7 +77,6 @@ async def is_contract(address: str, chain_id: int, api_key: str) -> bool:
     except Exception:
         pass
 
-    # Method 3: If the address has a contract creation transaction
     try:
         creation = await get_contract_creation(address, chain_id, api_key)
         if creation.get("contractCreator"):
@@ -60,7 +84,6 @@ async def is_contract(address: str, chain_id: int, api_key: str) -> bool:
     except Exception:
         pass
 
-    # If all methods fail, assume it's a contract (safer for audits)
     return True
 
 
@@ -119,6 +142,31 @@ async def get_deployer_address(address: str, chain_id: int, api_key: str) -> str
         return None
 
 
+async def get_bytecode(address: str, chain_id: int, api_key: str) -> str:
+    """
+    Fetch the runtime bytecode of a deployed contract using Etherscan V2.
+    Returns the bytecode as a hex string (with '0x' prefix) or empty string on failure.
+    """
+    try:
+        data = await _get(
+            {
+                "chainid": chain_id,
+                "module": "proxy",
+                "action": "eth_getCode",
+                "address": address,
+                "tag": "latest",
+            },
+            api_key,
+        )
+        # Some Etherscan endpoints return result directly as a string
+        result = data.get("result", "")
+        return result if result and result != "0x" else ""
+    except Exception as e:
+        print(f"[DEBUG] get_bytecode exception: {e}")
+        return ""
+
+
+
 async def get_top_holders(address: str, chain_id: int, api_key: str) -> list:
     data = await _get(
         {"chainid": chain_id, "module": "token",
@@ -132,18 +180,9 @@ async def get_top_holders(address: str, chain_id: int, api_key: str) -> list:
 
 
 def parse_source_json(source_str: str) -> dict | None:
-    """
-    Parse Etherscan/PolygonScan's multi‑file JSON source into a dict of {filename: content}.
-    Handles:
-    - Raw Solidity string
-    - Simple {"file.sol": "content"} format
-    - Standard JSON input format with {"sources": {"file.sol": {"content": "..."}}}
-    - PolygonScan's {{...}} wrapped format
-    """
     if not source_str:
         return None
     
-    # Remove surrounding {{ }} if present (PolygonScan format)
     cleaned = source_str.strip()
     if cleaned.startswith("{{") and cleaned.endswith("}}"):
         cleaned = cleaned[1:-1]
@@ -151,7 +190,6 @@ def parse_source_json(source_str: str) -> dict | None:
     try:
         data = json.loads(cleaned)
     except (json.JSONDecodeError, TypeError):
-        # Not JSON, assume raw source
         return None
     
     if not isinstance(data, dict):
@@ -159,9 +197,7 @@ def parse_source_json(source_str: str) -> dict | None:
     
     result = {}
     
-    # Check if this is Standard JSON input format (has "sources" key)
     if "sources" in data and isinstance(data["sources"], dict):
-        # Extract files from "sources" object
         for filename, filedata in data["sources"].items():
             if isinstance(filedata, dict):
                 content = filedata.get("content", "")
@@ -170,9 +206,7 @@ def parse_source_json(source_str: str) -> dict | None:
             elif isinstance(filedata, str):
                 result[filename] = filedata
     else:
-        # Simple format: keys are filenames
         for filename, filedata in data.items():
-            # Skip Standard JSON metadata keys
             if filename in ["language", "settings"]:
                 continue
             if isinstance(filedata, dict):
@@ -188,7 +222,6 @@ def parse_source_json(source_str: str) -> dict | None:
 
 
 def flatten_source_dict(source_dict: dict) -> str:
-    """Convert a dict of files into a single flattened Solidity string (for AI)."""
     if not source_dict:
         return ""
     combined = []
@@ -198,7 +231,6 @@ def flatten_source_dict(source_dict: dict) -> str:
 
 
 async def fetch_all(address: str, chain_id: int, api_key: str) -> dict:
-    """Fetch all contract data concurrently."""
     if not api_key:
         return {
             "verified": False, "source": "", "abi": "[]",
@@ -236,3 +268,32 @@ async def fetch_all(address: str, chain_id: int, api_key: str) -> dict:
         "tx_hash":       creation.get("txHash", ""),
         "top_holders":   holders if isinstance(holders, list) else [],
     }
+
+
+async def get_bytecode_rpc(address: str, chain: str, config: dict) -> str:
+    """
+    Fetch runtime bytecode using the chain's RPC endpoint (eth_getCode).
+    """
+    rpc_url = config.get("rpc", {}).get(chain, "")
+    if not rpc_url:
+        from analysis.mythril_integration import PUBLIC_RPC
+        rpc_url = PUBLIC_RPC.get(chain, "")
+    if not rpc_url or not rpc_url.startswith("http"):
+        return ""
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "params": [address, "latest"],
+        "id": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(rpc_url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("result", "")
+            return result if result and result != "0x" else ""
+    except Exception as e:
+        print(f"[DEBUG] RPC bytecode fetch failed: {e}")
+        return ""

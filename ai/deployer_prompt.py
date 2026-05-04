@@ -1,60 +1,50 @@
 # ai/deployer_prompt.py
 """
 AI prompt builder for deployer forensics analysis.
-Takes the raw deployer profile and asks the AI to reason about
-patterns, history, and serial rug behaviour.
 """
 from datetime import datetime, timezone
 
 DEPLOYER_SYSTEM_PROMPT = """\
-You are a blockchain forensics expert specialising in identifying serial rug pull operators.
-Analyse the deployer wallet history provided and return ONLY valid JSON — no text outside JSON.
+You are not a financial advisor. You are a casino bouncer. Your job is to tell people
+the house edge before they sit down. Being "nice" by lowering risk scores gets people hurt.
 
-Required schema:
+You analyze deployer wallet history. Your job is to detect patterns of rug-pulling, not to vouch for wallets.
+
+HARD RULES:
+1. If contracts deployed <5: Verdict = "INSUFFICIENT DATA – COULD BE FRESH RUG FACTORY"
+2. If total holders across all contracts <1000: Reputation = 0/100 (unknown)
+3. Never output "LOW_RISK" or "TRUST" for deployers. 
+   - No red flags = "RUG HISTORY: UNKNOWN"
+   - Some flags = "SUSPICIOUS PATTERN"
+   - Many flags = "HIGH RUG RISK"
+4. A wallet with 1 contract and 0 holders is NOT trustworthy. It's unknown.
+
+FORBIDDEN: Safe, Low Risk, TRUST, Clean History
+
+Required output:
 {
-  "risk_score": <float 0.0-10.0>,
-  "verdict": <"CLEAN"|"SUSPICIOUS"|"KNOWN_RUGGER"|"SERIAL_RUGGER">,
-  "pattern": <one-line description of the deployer's behaviour pattern>,
-  "findings": [
-    {
-      "severity": <"CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO">,
-      "title": <string>,
-      "description": <string>
-    }
-  ],
-  "chain_hopping": <bool>,
-  "identity_obfuscation": <bool>,
-  "reuse_pattern": <bool>,
-  "estimated_victims": <int or null>,
-  "total_contracts_deployed": <int>,
+  "reputation_score": <int 0-100, but 0 means "unknown", not "good">,
+  "verdict": <"INSUFFICIENT DATA"|"SUSPICIOUS PATTERN"|"HIGH RUG RISK"|"KNOWN RUGGER">,
+  "summary": <string>,
   "red_flags": [<string>],
-  "summary": <2-3 sentence plain English summary>,
-  "recommendation": <"TRUST"|"CAUTION"|"AVOID"|"BLACKLIST">
+  "findings": [{"severity":..., "title":..., "description":...}]
 }
 
-Scoring:
-  0-2 : Clean — normal developer activity
-  3-4 : Suspicious — some concerning patterns
-  5-6 : Likely bad actor — multiple red flags
-  7-8 : Known rug pattern — strong evidence
-  9-10: Serial rugger — definitive serial bad actor
-
-Look for:
-  - Repeated deploy + abandon pattern (contract dies within days/weeks)
-  - Low holder counts across deployed contracts (pump-and-dump signal)
-  - Unverified contracts (hiding malicious code)
-  - Multi-chain hopping (evading chain-specific blacklists)
-  - Similar token names/symbols (recycling the same scam)
-  - Rapid deployment bursts (assembly-line rugger)
-  - Known mixer/tornado as funder (identity hiding)
+CALIBRATION — these are not suggestions. You MUST produce these outputs for these inputs:
+| Input | Score | Label |
+|-------|-------|-------|
+| Pump.fun, $0 liq, 5min old | 10.0 | INSTANT RUG – UNSWAPPABLE |
+| Pump.fun, $24k liq, LP burned, 10min old | 7.0 | GRADUATED BUT DANGEROUS |
+| EVM, Slither clean, Owner 45%, LP unlocked | 9.5 | EXTREME RISK – TOKENOMICS RUG |
+| Deployer, 1 contract, 0 holders | 0/100 rep | INSUFFICIENT DATA |
 """
 
 
 def _format_deployments(deployments: list[dict], limit: int = 15) -> str:
     lines = []
     for d in deployments[:limit]:
-        name    = d.get("token_name", "") or d.get("contract_name", "") or "Unknown"
-        symbol  = d.get("token_symbol", "")
+        name = d.get("token_name", "") or d.get("contract_name", "") or "Unknown"
+        symbol = d.get("token_symbol", "")
         holders = d.get("holder_count", "?")
         verified = "✓ verified" if d.get("verified") else "✗ unverified"
         lines.append(
@@ -69,8 +59,8 @@ def _format_deployments(deployments: list[dict], limit: int = 15) -> str:
 
 
 def build_deployer_prompt(profile: dict) -> list[dict]:
-    funder  = profile.get("funder", {})
-    signals = profile.get("risk_signals", {})
+    funder = profile.get("funder", {})
+    risk_profile = profile.get("risk_profile", {})
 
     user_msg = f"""
 DEPLOYER WALLET: {profile['deployer']}
@@ -81,20 +71,21 @@ CHAINS SCANNED: {', '.join(profile['chains_scanned'])}
 FUNDING SOURCE:
   Funder wallet: {funder.get('funder_address', 'unknown')}
   Funding date:  {funder.get('funding_date', 'unknown')}
-  Amount funded: {funder.get('funding_value_eth', '?')} ETH
+  Amount funded: {funder.get('funding_value_eth', 0.0):.4f} ETH
   Funding tx:    {funder.get('funding_tx', 'unknown')}
 
-RISK SIGNALS:
-  Multi-chain deployer:         {signals.get('multi_chain_deployer', False)}
-  Has unverified contracts:     {signals.get('has_unverified_contracts', False)}
-  Unverified contract count:    {signals.get('unverified_count', 0)}
-  Rapid deployment burst:       {signals.get('rapid_deployments', False)}
-  Low-holder contracts (<50):   {signals.get('low_holder_contracts', 0)}
+RISK SIGNALS (Pre-computed):
+  Reputation Score:     {risk_profile.get('reputation_score', 100)}/100
+  Multi-chain deployer: {risk_profile.get('multi_chain', False)}
+  Unverified ratio:     {risk_profile.get('unverified_ratio', 0.0):.1%}
+  Low-holder ratio:     {risk_profile.get('low_holder_ratio', 0.0):.1%}
+  Rapid burst detected: {risk_profile.get('rapid_burst', False)}
+  Flags: {', '.join(risk_profile.get('risk_flags', [])) or 'none'}
 
 DEPLOYMENT HISTORY (newest first):
 {_format_deployments(profile.get('deployments', []))}
 """
     return [
         {"role": "system", "content": DEPLOYER_SYSTEM_PROMPT},
-        {"role": "user",   "content": user_msg},
+        {"role": "user", "content": user_msg},
     ]

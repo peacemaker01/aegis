@@ -1,12 +1,4 @@
 # analysis/mythril_integration.py
-"""
-Mythril integration for Aegis – symbolic execution engine.
-
-Uses contract address analysis (bytecode) rather than source code.
-Supports user‑provided RPC URLs (from config) and falls back to public endpoints.
-Converts full HTTP URLs to HOST:PORT format required by Mythril.
-"""
-
 import subprocess
 import json
 import sys
@@ -15,12 +7,8 @@ from urllib.parse import urlparse
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 
-# ──────────────────────────────────────────────────────────────
-# Mythril detection
-# ──────────────────────────────────────────────────────────────
 
 def _get_mythril_cmd() -> Optional[List[str]]:
-    """Return command to run mythril as list (binary or python -m)."""
     import shutil
     mythril_bin = shutil.which('mythril')
     if mythril_bin:
@@ -28,9 +16,7 @@ def _get_mythril_cmd() -> Optional[List[str]]:
     try:
         result = subprocess.run(
             [sys.executable, '-m', 'mythril', 'version'],
-            capture_output=True,
-            text=True,
-            timeout=5
+            capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             return [sys.executable, '-m', 'mythril']
@@ -43,21 +29,12 @@ def is_mythril_available() -> bool:
     return _get_mythril_cmd() is not None
 
 
-# ──────────────────────────────────────────────────────────────
-# Severity mapping
-# ──────────────────────────────────────────────────────────────
-
 MYTHRIL_SEVERITY_MAP = {
     'High': 'HIGH',
     'Medium': 'MEDIUM',
     'Low': 'LOW',
     'Informational': 'INFO',
 }
-
-
-# ──────────────────────────────────────────────────────────────
-# Public fallback RPC endpoints (full URLs, will be converted to HOST:PORT)
-# ──────────────────────────────────────────────────────────────
 
 PUBLIC_RPC = {
     'eth': 'https://cloudflare-eth.com',
@@ -72,104 +49,101 @@ PUBLIC_RPC = {
     'gnosis': 'https://rpc.gnosischain.com/',
 }
 
+INFURA_CHAINS = {
+    'eth': 'infura-mainnet',
+    'polygon': 'infura-polygon',
+    'arb': 'infura-arbitrum',
+    'op': 'infura-optimism',
+    'base': 'infura-base',
+    'avax': 'infura-avalanche',
+}
 
-# ──────────────────────────────────────────────────────────────
-# Helper to convert URL to HOST:PORT
-# ──────────────────────────────────────────────────────────────
 
 def _url_to_host_port(url: str) -> str:
-    """Convert a URL to HOST:PORT format for Mythril's --rpc argument."""
     parsed = urlparse(url)
     host = parsed.hostname
     if not host:
-        return url  # fallback
+        return url
     port = parsed.port
     if port is None:
         port = 443 if parsed.scheme == 'https' else 80
     return f"{host}:{port}"
 
 
-# ──────────────────────────────────────────────────────────────
-# Core analysis function
-# ──────────────────────────────────────────────────────────────
-
 def run_mythril_on_address(
     address: str,
     chain: str,
     debug: bool = False,
-    rpc_url: str = None
+    rpc_url: str = None,
+    infura_id: str = None,
+    timeout: int = 180
 ) -> List[dict]:
-    """
-    Run Mythril on a deployed contract address.
-
-    Args:
-        address: Contract address (0x...)
-        chain: Chain key (eth, bsc, polygon, etc.)
-        debug: Print debug output
-        rpc_url: Optional custom RPC URL (overrides default)
-
-    Returns:
-        List of findings (empty on error or if Mythril not installed)
-    """
     mythril_cmd = _get_mythril_cmd()
     if not mythril_cmd:
         if debug:
-            print("[DEBUG] Mythril not found. Install with: pip install mythril")
+            print("[DEBUG] Mythril not found.")
         return []
 
-    # Determine RPC argument
-    if rpc_url:
-        rpc_arg = rpc_url
-    else:
-        rpc_arg = PUBLIC_RPC.get(chain)
-        if not rpc_arg:
-            if debug:
-                print(f"[DEBUG] No RPC endpoint for chain '{chain}', skipping Mythril")
-            return []
-
-    # Convert full URL to HOST:PORT if it looks like a URL
-    if rpc_arg.startswith('http'):
-        rpc_arg = _url_to_host_port(rpc_arg)
-
-    # Build command
     cmd = mythril_cmd + [
-        'analyze',
-        '-a', address,
-        '--rpc', rpc_arg,
-        '-o', 'jsonv2',
-        '--execution-timeout', '30',
+        'analyze', '-a', address, '-o', 'jsonv2',
+        '--execution-timeout', str(timeout)
     ]
 
+    rpc_arg = None
+    use_infura = False
+
+    if rpc_url:
+        if rpc_url.startswith("infura-"):
+            use_infura = True
+            rpc_arg = rpc_url
+        else:
+            rpc_arg = _url_to_host_port(rpc_url) if rpc_url.startswith('http') else rpc_url
+    else:
+        infura_network = INFURA_CHAINS.get(chain.lower())
+        if infura_network and infura_id:
+            use_infura = True
+            rpc_arg = infura_network
+        else:
+            public = PUBLIC_RPC.get(chain.lower())
+            if public:
+                rpc_arg = _url_to_host_port(public)
+
+    if not rpc_arg:
+        if debug:
+            print(f"[DEBUG] No RPC endpoint for chain '{chain}'")
+        return []
+
+    if use_infura:
+        if not infura_id:
+            if debug:
+                print("[DEBUG] Infura ID required")
+            return []
+        cmd.extend(["--infura-id", infura_id])
+
+    cmd.extend(['--rpc', rpc_arg])
+
     if debug:
-        print(f"[DEBUG] ✓ Mythril found: {' '.join(mythril_cmd)}")
-        print(f"[DEBUG] Analyzing address: {address}")
-        print(f"[DEBUG] RPC: {rpc_arg}")
-        print(f"[DEBUG] Command: {' '.join(cmd)}")
+        print(f"[DEBUG] Mythril command: {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
         if debug:
             print(f"[DEBUG] Mythril return code: {result.returncode}")
 
+        # Even if return code is non-zero, Mythril may have produced partial output.
         if not result.stdout:
-            if debug:
-                print("[DEBUG] Mythril produced no output")
             return []
 
-        # Parse JSON (Mythril outputs a JSON array of result objects)
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as e:
-            if debug:
-                print(f"[DEBUG] JSON decode error: {e}")
-                print(f"[DEBUG] Raw output: {result.stdout[:300]}")
-            return []
-
+        data = json.loads(result.stdout)
         return _parse_mythril_output(data, debug)
 
     except subprocess.TimeoutExpired:
         if debug:
-            print("[DEBUG] Mythril analysis timed out after 60 seconds")
+            print("[DEBUG] Mythril analysis timed out")
+        return []
+    except json.JSONDecodeError as e:
+        if debug:
+            print(f"[DEBUG] JSON decode error: {e}")
         return []
     except Exception as e:
         if debug:
@@ -178,68 +152,73 @@ def run_mythril_on_address(
 
 
 def _parse_mythril_output(data, debug: bool = False) -> List[dict]:
-    """Parse Mythril JSON output (jsonv2 format) into Aegis findings."""
     findings = []
 
-    # Mythril returns a list of analysis result objects, each with an 'issues' key
-    if isinstance(data, list):
-        all_issues = []
-        for result_obj in data:
-            if isinstance(result_obj, dict):
-                issues = result_obj.get('issues', [])
-                if issues:
-                    all_issues.extend(issues)
-        issues = all_issues
-    elif isinstance(data, dict):
-        issues = data.get('issues', [])
-    else:
-        if debug:
-            print(f"[DEBUG] Unexpected Mythril output type: {type(data)}")
+    def find_value(obj, key):
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for v in obj.values():
+                res = find_value(v, key)
+                if res is not None:
+                    return res
+        elif isinstance(obj, list):
+            for item in obj:
+                res = find_value(item, key)
+                if res is not None:
+                    return res
+        return None
+
+    def extract_issues(obj):
+        issues = find_value(obj, 'issues')
+        if issues is None:
+            return []
+        if isinstance(issues, dict):
+            return [issues]
+        if isinstance(issues, list):
+            return issues
         return []
+
+    issues = extract_issues(data)
 
     for issue in issues:
         if not isinstance(issue, dict):
             continue
 
+        if debug:
+            print(f"[DEBUG] Mythril issue keys: {list(issue.keys())}")
+
         severity_raw = issue.get('severity', 'Low')
         severity = MYTHRIL_SEVERITY_MAP.get(severity_raw, 'LOW')
 
+        # Prioritize swcTitle (Mythril's actual field name)
         title = (
+            issue.get('swcTitle') or
             issue.get('title') or
             issue.get('name') or
             issue.get('check') or
-            issue.get('swc-title') or
+            find_value(issue, 'swcTitle') or
+            find_value(issue, 'title') or
             'Unknown Issue'
         )
 
-        description = issue.get('description', '')
+        description = (
+            issue.get('description') or
+            find_value(issue, 'description') or
+            ''
+        )
 
-        # Extract location
-        locations = issue.get('locations', [])
-        line = None
-        filename = ''
-        if locations:
-            loc = locations[0] if isinstance(locations, list) else locations
-            if isinstance(loc, dict):
-                filename = loc.get('filename', '')
-                line = loc.get('line', None)
+        line = find_value(issue, 'line') or find_value(issue, 'sourceMap')
+        swc_id = issue.get('swcID') or issue.get('swc-id') or ''
 
-        swc_id = issue.get('swc-id', '')
-        swc_title = issue.get('swc-title', '')
-
-        finding = {
+        findings.append({
             "source": "mythril",
-            "detector": title,
-            "severity": severity,
-            "confidence": "MEDIUM",
             "title": title,
+            "severity": severity,
             "description": description,
             "line": line,
-            "filename": filename,
             "swc_id": swc_id,
-            "swc_title": swc_title,
-        }
-        findings.append(finding)
+        })
 
         if debug:
             print(f"[DEBUG] Mythril: {severity} - {title} (line {line})")
@@ -247,42 +226,27 @@ def _parse_mythril_output(data, debug: bool = False) -> List[dict]:
     return findings
 
 
-# ──────────────────────────────────────────────────────────────
-# Async background execution (for non‑blocking deep analysis)
-# ──────────────────────────────────────────────────────────────
-
-_mythril_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mythril-bg")
+_mythril_executor = ThreadPoolExecutor(max_workers=1)
 
 
 async def run_mythril_on_address_async(
-    address: str,
-    chain: str,
-    debug: bool = False,
-    timeout: float = 45.0,
-    rpc_url: str = None
+    address: str, chain: str, debug: bool = False, timeout: float = 185.0,
+    rpc_url: str = None, infura_id: str = None
 ) -> List[dict]:
-    """
-    Run Mythril asynchronously in background thread with timeout.
-    """
     loop = asyncio.get_event_loop()
     try:
-        findings = await asyncio.wait_for(
+        return await asyncio.wait_for(
             loop.run_in_executor(
-                _mythril_executor,
-                run_mythril_on_address,
-                address,
-                chain,
-                debug,
-                rpc_url
+                _mythril_executor, run_mythril_on_address,
+                address, chain, debug, rpc_url, infura_id, int(timeout)
             ),
-            timeout=timeout
+            timeout=timeout + 5
         )
-        return findings
     except asyncio.TimeoutError:
         if debug:
-            print(f"[DEBUG] Mythril background task timed out after {timeout}s (audit continued without it)")
+            print(f"[DEBUG] Mythril async timed out after {timeout}s")
         return []
-    except Exception as exc:
+    except Exception as e:
         if debug:
-            print(f"[DEBUG] Mythril background error: {exc}")
+            print(f"[DEBUG] Mythril async error: {e}")
         return []

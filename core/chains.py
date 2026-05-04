@@ -1,5 +1,6 @@
 # core/chains.py
-# Etherscan V2 — single API key covers all chains
+# Etherscan V2 — single API key covers all EVM chains
+# Solana uses separate RPC/API infrastructure
 
 CHAINS = {
     "eth":     {"id": 1,      "name": "Ethereum",       "symbol": "ETH"},
@@ -12,6 +13,7 @@ CHAINS = {
     "fantom":  {"id": 250,    "name": "Fantom",          "symbol": "FTM"},
     "zksync":  {"id": 324,    "name": "zkSync Era",      "symbol": "ETH"},
     "gnosis":  {"id": 100,    "name": "Gnosis",          "symbol": "xDAI"},
+    "solana":  {"id": None,   "name": "Solana",          "symbol": "SOL"},
 }
 
 CHAIN_ALIASES = {
@@ -35,6 +37,7 @@ def resolve_chain(name: str) -> str:
 
 
 def get_chain(name: str) -> dict:
+    """Return chain metadata dict with canonical key."""
     key = resolve_chain(name)
     if key not in CHAINS:
         supported = ", ".join(CHAINS.keys())

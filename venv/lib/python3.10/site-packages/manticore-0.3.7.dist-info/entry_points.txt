@@ -1,0 +1,4 @@
+[console_scripts]
+manticore = manticore.__main__:main
+manticore-verifier = manticore.ethereum.verifier:main
+

@@ -1,0 +1,3 @@
+[console_scripts]
+wasmdump = wasm.__main__:dump
+
