@@ -3,7 +3,8 @@
 Aegis Security Bot – Multi‑chain smart contract audit, smart money radar,
 new token scout, deployer forensics, wallet portfolio analysis.
 """
-import os, sys, logging, asyncio, json, html, io, time, httpx
+import os, sys, logging, asyncio, json, html, io, time, httpx, threading
+import uvicorn
 from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,6 +23,7 @@ from utils.validators import is_solana_address, is_evm_address
 from services.smartmoney import get_smart_money_tokens
 from services.newtokens import get_new_tokens
 from services.pdf_report import generate_audit_pdf
+from api import app
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1441,7 +1443,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ─────────────────────────── Main ──────────────────────────────────────
-def main():
+def main() -> None:
     asyncio.run(init_db())
     try:
         from fetchers.etherscan import init_etherscan_pool
@@ -1465,4 +1467,19 @@ def main():
     application.add_error_handler(error_handler)
     logger.info("Starting Aegis Telegram Bot…"); application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__": main()
+
+def run_telegram_bot():
+    """Run the Telegram bot polling loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main())
+
+
+if __name__ == "__main__":
+    # Start the Telegram bot in a background daemon thread
+    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    bot_thread.start()
+
+    # Run FastAPI on the Render‑provided PORT
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
