@@ -1443,39 +1443,57 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ─────────────────────────── Main ──────────────────────────────────────
-async def main() -> None:
+async def run_fastapi_server(port: int):
+    """Run FastAPI as an asyncio task alongside the bot."""
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def main_async():
+    """Initialize the bot and start FastAPI in the same event loop."""
     await init_db()
+
     try:
         from fetchers.etherscan import init_etherscan_pool
         etherscan_keys = config["explorers"].get("etherscan", [])
-        if etherscan_keys: init_etherscan_pool(etherscan_keys, calls_per_second=5.0)
-    except Exception as e: logger.warning(f"Etherscan pool init: {e}")
+        if etherscan_keys:
+            init_etherscan_pool(etherscan_keys, calls_per_second=5.0)
+    except Exception as e:
+        logger.warning(f"Etherscan pool init: {e}")
+
     token = config["telegram"]["bot_token"]
-    if not token: logger.error("TELEGRAM_BOT_TOKEN missing"); sys.exit(1)
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN missing")
+        sys.exit(1)
+
     application = Application.builder().token(token).build()
-    for cmd, handler in [("start", start), ("help", help_command), ("subscribe", subscribe_command),
-                         ("verify", verify_command), ("status", status_command),
-                         ("degenflow", degenflow_command), ("flow", degenflow_command),
-                         ("new", degenflow_command), ("newtoken", degenflow_command),
-                         ("newtokens", degenflow_command), ("radar", degenflow_command),
-                         ("smartmoney", degenflow_command),
-                         ("scan", lambda u,c: scan_command(u,c,True)), ("deepscan", deepscan_command),
-                         ("deployer", deployer_command),
-                         ("wallet", wallet_command)]:
+
+    for cmd, handler in [
+        ("start", start), ("help", help_command), ("subscribe", subscribe_command),
+        ("verify", verify_command), ("status", status_command),
+        ("degenflow", degenflow_command), ("flow", degenflow_command),
+        ("new", degenflow_command), ("newtoken", degenflow_command),
+        ("newtokens", degenflow_command), ("radar", degenflow_command),
+        ("smartmoney", degenflow_command),
+        ("scan", lambda u, c: scan_command(u, c, True)), ("deepscan", deepscan_command),
+        ("deployer", deployer_command),
+        ("wallet", wallet_command),
+    ]:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
-    logger.info("Starting Aegis Telegram Bot…"); await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+    # ── Manually initialise and start the bot (no run_polling) ─────────────
+    logger.info("Starting Aegis Telegram Bot…")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-def run_fastapi():
-    """Run the FastAPI health endpoint in a daemon thread."""
+    # ── Run FastAPI in the same event loop ─────────────────────────────────
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    logger.info(f"Starting FastAPI on port {port}…")
+    await run_fastapi_server(port)
 
 
 if __name__ == "__main__":
-    # Start FastAPI in a daemon thread so it binds to PORT immediately
-    threading.Thread(target=run_fastapi, daemon=True).start()
-    # Run the Telegram bot in the main thread (no asyncio.run in sub-thread)
-    asyncio.run(main())
+    asyncio.run(main_async())
