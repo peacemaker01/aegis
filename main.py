@@ -1443,8 +1443,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # ─────────────────────────── Main ──────────────────────────────────────
-def main() -> None:
-    asyncio.run(init_db())
+async def main() -> None:
+    await init_db()
     try:
         from fetchers.etherscan import init_etherscan_pool
         etherscan_keys = config["explorers"].get("etherscan", [])
@@ -1465,14 +1465,12 @@ def main() -> None:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
-    logger.info("Starting Aegis Telegram Bot…"); application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting Aegis Telegram Bot…"); await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 def run_telegram_bot():
     """Run the Telegram bot polling loop."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
