@@ -41,6 +41,16 @@ async def init_db():
             )
         ''')
         await db.execute('''
+            CREATE TABLE IF NOT EXISTS cryptomus_orders (
+                order_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                amount_usd REAL,
+                days INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
             CREATE TABLE IF NOT EXISTS usage_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -232,3 +242,23 @@ async def toggle_alert(user_id: int, tag: str) -> Optional[bool]:
             )
             await db.commit()
             return bool(new_state)
+
+async def create_cryptomus_order(order_id: str, user_id: int, amount_usd: float, days: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO cryptomus_orders (order_id, user_id, amount_usd, days, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        ''', (order_id, user_id, amount_usd, days))
+        await db.commit()
+
+async def get_cryptomus_order(order_id: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM cryptomus_orders WHERE order_id = ?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def update_cryptomus_order_status(order_id: str, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE cryptomus_orders SET status = ? WHERE order_id = ?", (status, order_id))
+        await db.commit()

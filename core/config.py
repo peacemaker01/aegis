@@ -87,6 +87,10 @@ def load_config() -> dict:
             "api_key": birdeye_key.split(",")[0] if birdeye_key else "",
             "api_keys": [k.strip() for k in birdeye_key.split(",") if k.strip()],
         },
+        "cryptomus": {
+            "merchant_id": os.getenv("CRYPTOMUS_MERCHANT_ID", ""),
+            "payment_key": os.getenv("CRYPTOMUS_PAYMENT_KEY", ""),
+        },
     }
 
 
@@ -111,4 +115,6 @@ def validate_config(config: dict) -> dict:
         warnings.append("⚠️ MORALIS_API_KEY missing – wallet tracking disabled")
     if not config["birdeye"]["api_keys"]:
         warnings.append("⚠️ BIRDEYE_API_KEY missing – Pump.fun Casino Feed disabled")
+    if not config["cryptomus"]["merchant_id"] or not config["cryptomus"]["payment_key"]:
+        warnings.append("⚠️ CRYPTOMUS keys missing – Subscription purchasing disabled")
     return {"errors": errors, "warnings": warnings}

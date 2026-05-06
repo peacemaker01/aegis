@@ -24,6 +24,7 @@ from services.smartmoney import get_smart_money_tokens
 from services.newtokens import get_new_tokens
 from services.pdf_report import generate_audit_pdf
 from api import app
+import uuid
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -254,41 +255,17 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp = datetime.fromisoformat(db_user["subscription_expires_at"]).strftime("%Y-%m-%d")
         await update.message.reply_text(f"✅ You already have an active subscription until {exp}.")
         return
-    try:
-        price = await payment_verifier.get_token_price()
-        required = await payment_verifier.required_tokens()
-    except Exception:
-        await update.message.reply_text("❌ Could not fetch token price. Try again later.")
-        return
-    receiver = str(payment_verifier.payment_receiver)
+
+    keyboard = [
+        [InlineKeyboardButton("1 Month ($14.99)", callback_data="cryptomus_pay_30")],
+        [InlineKeyboardButton("1 Year ($165.00)", callback_data="cryptomus_pay_365")]
+    ]
     msg = (
         f"<b>💎 Subscribe to Aegis Premium</b>\n\n"
-        f"Monthly price: <b>${config['subscription']['price_usd']:.2f}</b>\n"
-        f"Current $AEGIS price: <code>{price:.6f}</code>\n"
-        f"Tokens required: <b>{required:.2f} $AEGIS</b>\n\n"
-        f"1️⃣ Send exactly the required amount to:\n<code>{escape_html(receiver)}</code>\n\n"
-        f"2️⃣ After sending, use: <code>/verify &lt;transaction_signature&gt;</code>\n\n"
-        f"<i>Note:</i> 60% burned 🔥, 40% to treasury 💰"
+        f"Unlock unlimited deep scans, deployer forensics, wallet tracking, and the Pump.fun radar.\n\n"
+        f"Select a subscription tier to generate a secure checkout link (supports Crypto via Cryptomus):"
     )
-
-async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_private_chat(update): return
-    args = context.args
-    if not args: await update.message.reply_text("Usage: /verify <tx_signature>"); return
-    signature = args[0].strip(); user_id = update.effective_user.id
-    msg = await update.message.reply_text("⌛ Verifying transaction on Solana...")
-    result = await process_verification(user_id, signature)
-    if not result["success"]:
-        await msg.edit_text(f"❌ Verification failed: {escape_html(result['error'])}", parse_mode="HTML"); return
-    expires = result["expires_at"].strftime("%Y-%m-%d")
-    split_info = f"\nSplit tx: <code>{escape_html(result['split_tx'])}</code>" if result.get("split_tx") else ""
-    await msg.edit_text(
-        f"❅ \u003cb\u003ePayment verified!\u003c/b\u003e\nSubscription active until \u003cb\u003e{escape_html(expires)}\u003c/b\u003e.\n"
-        f"60% burned 🔥, 40% to treasury 💰{split_info}", parse_mode="HTML"
-    )
-    if config["telegram"]["admin_user_id"]:
-        try: await context.bot.send_message(config["telegram"]["admin_user_id"], f"💰 New subscription: User {user_id} paid for 30 days.")
-        except Exception: pass
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def trust_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The Aegis Trust Manifesto."""
@@ -350,23 +327,15 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     # ── Holder concentration (if available) ────────────────────────────
     top10_pct = None
     holder_count = len(holders)
-    dev_pct = None
-
-    # Fallback to RugCheck holder count if Helius fails (common for massive tokens like USDC)
-    total_holders = rugcheck.get('total_holder_count') or rugcheck.get('totalHolders') or 0
-    if total_holders and not holders:
-        holder_count = int(total_holders)
-
     if holders:
         top10_pct = sum(h.get('percentage', 0) for h in holders[:10])
-        dev_pct = holders[0].get('percentage', None) if holders else None
 
     # ── LP lock from RugCheck ─────────────────────────────────────────
     lp_locked = False
     lp_lock_days = 0
     locks = rugcheck.get('locks', [])
     if locks:
-        max_lock = max(locks, key=lambda x: x.get("unlockDate", 0))
+        max_lock = max(locks, key=lambda x: x.get('unlockDate', 0))
         unlock_ts = (max_lock.get('unlockDate') or 0) / 1000
         if unlock_ts > datetime.now(timezone.utc).timestamp():
             lp_locked = True
@@ -376,7 +345,7 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     score = 0.0
     flags = []
 
-    # ── Base‑rate adjustment for Pump.fun origin ────────────────────────
+    # Pump.fun base‑rate adjustment
     is_pump = ca.endswith('pump')
     if is_pump:
         score += 2.0
@@ -392,47 +361,51 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         score += 1.0
         flags.append(f'Low liquidity (${liq:,.0f})')
     elif liq > 1_000_000:
-        score -= 2.0
+        score -= 1.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    # ---- Age (STRICT: only apply if we actually have the data) ----
+    # ---- Age (STRICT GUARD) ----
     if age_hours is not None and age_hours != 999:
         if age_hours < 1:
             score += 2.0
             flags.append('Brand new (<1 hour)')
         elif age_hours < 24:
             score += 1.5
-            flags.append(f'Very new ({int(age_hours)}h)')
-        elif age_hours < 720:   # 30 days
+            flags.append(f"Very new ({int(age_hours)}h)")
+        elif age_hours < 720:
             score += 0.5
             flags.append(f'Less than 30 days old')
-        elif age_hours > 4320:  # 180 days
-            score -= 2.0
+        elif age_hours > 4320:
+            score -= 1.0
             flags.append('Long track record (180+ days)')
 
     # ---- Holder concentration (only if data available) ----
     if top10_pct is not None:
-        if top10_pct > 70:
+        if top10_pct > 80:
+            score += 4.0
+            flags.append(f'CRITICAL concentration: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 70:
             score += 3.0
             flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
         elif top10_pct > 50:
             score += 1.0
             flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 30:
+            score += 0.5
+            flags.append(f'Elevated concentration: Top10 hold {top10_pct:.0f}%')
         elif top10_pct < 30:
             score -= 1.0
             flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
 
     # ---- LP lock ----
     if not lp_locked and not mint_revoked and not freeze_revoked:
-        # LP unlocked but authorities are also live – this is normal for managed tokens
-        # Don't penalise; just note it
-        pass
+        pass   # normal for managed tokens
     elif not lp_locked:
         score += 3.0
         flags.append('LP unlocked – liquidity can be removed')
     elif lp_lock_days > 180:
         score -= 1.0
-        flags.append(f'LP locked for {lp_lock_days}d')
+        flags.append(f"LP locked for {lp_lock_days}d")
 
     # ---- Authorities ----
     if not mint_revoked:
@@ -449,6 +422,13 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         score -= 1.0
         flags.append('Freeze authority revoked')
 
+    # ---- Floor Rule (Structural Risk Override) ----
+    # No amount of liquidity/age bonus should make a concentrated, unlocked token "Low Risk"
+    if not lp_locked and top10_pct is not None and top10_pct > 60:
+        if score < 3.0:
+            score = 3.0
+            flags.append('Structural floor: Unlocked LP + High concentration')
+
     # ---- Final clamping ----
     score = max(0.0, min(10.0, score))
 
@@ -462,31 +442,36 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     elif score >= 5.0:
         label = 'ELEVATED RISK – SPECULATIVE'
     elif score >= 3.0:
-        label = 'MODERATE RISK – NEW TOKEN'
-    elif score <= 1.0:
-        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
-    else:
+        label = 'MODERATE RISK'
+    elif score >= 2.0:
+        label = 'CAUTION – MIXED SIGNALS'
+    elif score >= 1.0:
         label = 'LOW RISK – ESTABLISHED ASSET'
+    else:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
 
     # ---- Build summaries ----
-    code_parts = ['Pump.fun' if ca.endswith('pump') else 'SPL Token']
+    code_parts = ['Pump.fun' if is_pump else 'SPL Token']
     code_parts.append('Mint: Revoked' if mint_revoked else 'Mint: LIVE')
     code_parts.append('Freeze: Revoked' if freeze_revoked else 'Freeze: LIVE')
     code_summary = ' | '.join(code_parts)
 
     if holders:
         bag_alert = f'Top10: {top10_pct:.0f}% | Holders: {holder_count}'
-    elif holder_count:
-        bag_alert = f'Total holders: {holder_count} (distribution unverified)'
     else:
         bag_alert = 'Holder data unavailable'
     if liq:
         bag_alert += f' | LIQ: ${liq:,.0f}'
 
     lp_status = f'Locked {lp_lock_days}d' if lp_locked else 'Unlocked'
-    age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours/24)}d' if age_hours < 999 else '?'
+    # age_hours == 999 is our sentinel for "unknown". Never display it as a real age.
+    if age_hours is not None and age_hours != 999:
+        age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours / 24)}d'
+    else:
+        age_str = '?'
 
-    main_risk = flags[0] if flags else 'Insufficient data – see flags below'
+    risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
+    main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data – see flags below')
 
     return {
         'score': round(score, 1),
@@ -579,7 +564,7 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         score += 3.0
         flags.append(f'Very thin liquidity (${liq:,.0f})')
     elif liq > 1_000_000:
-        score -= 2.0
+        score -= 1.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
 
     # ---- Age (STRICT: only apply if we actually have the data) ----
@@ -594,12 +579,15 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
             score += 0.5
             flags.append(f'Less than 30 days old')
         elif age_hours > 4320:
-            score -= 2.0
+            score -= 1.0
             flags.append('Long track record (180+ days)')
 
     # Owner concentration (only if GoPlus returned data)
     if owner_pct is not None:
-        if owner_pct > 40:
+        if owner_pct > 80:
+            score += 4.0
+            flags.append(f'CRITICAL concentration: Owner holds {owner_pct:.0f}%')
+        elif owner_pct > 40:
             score += 2.0
             flags.append(f'Owner holds {owner_pct:.0f}%')
         elif owner_pct > 20:
@@ -639,6 +627,12 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         score += 2.0
         flags.append(f'Bytecode similarity to rugs: {clone_score:.0%}')
 
+    # ---- Floor Rule ----
+    if not lp_locked and owner_pct is not None and owner_pct > 40:
+        if score < 3.0:
+            score = 3.0
+            flags.append('Structural floor: Unlocked LP + High concentration')
+
     # Final clamping
     score = max(0.0, min(10.0, score))
 
@@ -652,11 +646,13 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
     elif score >= 5.0:
         label = 'ELEVATED RISK – SPECULATIVE'
     elif score >= 3.0:
-        label = 'MODERATE RISK – NEW TOKEN'
-    elif score <= 1.0:
-        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
-    else:
+        label = 'MODERATE RISK'
+    elif score >= 2.0:
+        label = 'CAUTION – MIXED SIGNALS'
+    elif score >= 1.0:
         label = 'LOW RISK – ESTABLISHED ASSET'
+    else:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
 
     # Summaries
     code_summary = f"Mintable: {mintable} | Owner: {owner_pct}%" if owner_pct is not None else "Tokenomics data unavailable"
@@ -664,11 +660,18 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
     if liq:
         bag_alert += f' | LIQ: ${liq:,.0f}'
     lp_status_str = 'Locked' if lp_locked else 'Unlocked' if lp_locked is not None else 'Unknown'
-    age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours/24)}d' if age_hours < 999 else '?'
+    # age_hours == 999 is the sentinel for unknown – never show it as a real age
+    if age_hours is not None and age_hours != 999:
+        age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours / 24)}d'
+    else:
+        age_str = '?'
+
+    risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
+    main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data')
 
     return make_risk_dict(round(score, 1), label, code_summary, bag_alert,
                           age_str, f'${liq:,.0f}' if liq else '$0', lp_status_str,
-                          flags[0] if flags else 'Insufficient data',
+                          main_risk,
                           '', flags, dex_token_name, dex_token_symbol)
 def format_age(hours: float) -> str:
     if hours is None or hours == 999:
@@ -1235,7 +1238,7 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
         score += 1.0
         flags.append(f'Low liquidity (${liq:,.0f})')
     elif liq > 1_000_000:
-        score -= 2.0
+        score -= 1.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
 
     # ---- Age ----
@@ -1249,20 +1252,22 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
         score += 0.5
         flags.append(f'Less than 30 days old')
     elif age_hours > 4320:  # 180 days
-        score -= 2.0
+        score -= 1.0
         flags.append('Long track record (180+ days)')
-    elif age_hours > 8760:  # 365 days
-        score -= 3.0
-        # Already flagged above; just adjust
-        pass
 
     # ---- Holder concentration ----
-    if top10_pct > 70:
+    if top10_pct > 80:
+        score += 4.0
+        flags.append(f'CRITICAL concentration: Top10 hold {top10_pct:.0f}%')
+    elif top10_pct > 70:
         score += 3.0
         flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
     elif top10_pct > 50:
         score += 1.0
         flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+    elif top10_pct > 30:
+        score += 0.5
+        flags.append(f'Elevated concentration: Top10 hold {top10_pct:.0f}%')
     elif top10_pct < 30:
         score -= 1.0
         flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
@@ -1298,6 +1303,12 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
         score -= 1.0
         flags.append('Freeze authority revoked')
 
+    # ---- Floor Rule ----
+    if not lp_locked and top10_pct > 60:
+        if score < 3.0:
+            score = 3.0
+            flags.append('Structural floor: Unlocked LP + High concentration')
+
     # ---- Final clamping ----
     score = max(0.0, min(10.0, score))
 
@@ -1311,11 +1322,13 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
     elif score >= 5.0:
         label = 'ELEVATED RISK – SPECULATIVE'
     elif score >= 3.0:
-        label = 'MODERATE RISK – NEW TOKEN'
-    elif score <= 1.0:
-        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
-    else:
+        label = 'MODERATE RISK'
+    elif score >= 2.0:
+        label = 'CAUTION – MIXED SIGNALS'
+    elif score >= 1.0:
         label = 'LOW RISK – ESTABLISHED ASSET'
+    else:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
 
     # ---- Build summaries ----
     code_parts = ['Pump.fun' if is_pump else 'SPL Token']
@@ -1329,7 +1342,8 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
     if liq:
         bag_alert += f' | LIQ: ${liq:,.0f}'
 
-    main_risk = flags[0] if flags else 'New token — treat as high risk until proven otherwise'
+    risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
+    main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'New token — treat as high risk until proven otherwise')
 
     return {
         "risk_score": round(score, 1), "risk_label": label, "code_summary": code_summary,
@@ -1390,7 +1404,30 @@ def _format_filters_display(filters: dict) -> str:
 # ─────────────────────────── Callback handler ───────────────────────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data
-    if data == "sample_scan":
+    if data.startswith("cryptomus_pay_"):
+        days = int(data.split("_")[-1])
+        amount_usd = 14.99 if days == 30 else 165.00
+        order_id = str(uuid.uuid4())
+        
+        user_id = update.effective_user.id
+        from core.db import create_cryptomus_order
+        from core.cryptomus import create_payment_invoice
+        
+        await create_cryptomus_order(order_id, user_id, amount_usd, days)
+        url = await create_payment_invoice(order_id, amount_usd)
+        
+        if url:
+            keyboard = [[InlineKeyboardButton("Pay Now via Cryptomus", url=url)]]
+            await query.message.edit_text(
+                f"<b>Secure Checkout Generated</b>\n\n"
+                f"Tier: {days} Days\nAmount: ${amount_usd:.2f}\n\n"
+                f"<i>Click the button below to complete your payment. Your subscription will activate automatically upon confirmation.</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.message.edit_text("❌ Failed to generate checkout link. Please try again later.")
+    elif data == "sample_scan":
         await query.edit_message_text("🔍 Running a sample audit on USDC (Solana)...")
         await scan_command(update, context, fast_mode=True)
     elif data == "cmd_scan_prompt":
@@ -1554,6 +1591,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.edit_message_text("I can explain that further. What specifically would you like to know?", parse_mode="HTML")
 
+# ─────────────────────────── Admin & Legal ───────────────────────────
+async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📜 <b>Terms of Service & Disclaimer</b>\n\n"
+        "Aegis is an automated security analysis tool. By using Aegis, you agree to the following:\n\n"
+        "1. <b>Not Financial Advice:</b> Aegis does not provide financial advice. Risk scores are based purely on automated on-chain metrics.\n"
+        "2. <b>False Positives/Negatives:</b> No automated tool is 100% accurate. Aegis may occasionally flag safe tokens or miss sophisticated scams. Always do your own research (DYOR).\n"
+        "3. <b>Liability:</b> The creators of Aegis are not responsible for any financial losses incurred while using the tool."
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != config["telegram"]["admin_user_id"]: return
+    try:
+        target_id = int(context.args[0])
+        days = int(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /grant <user_id> <days>")
+        return
+    
+    from core.subscription import get_or_create_user
+    from datetime import timedelta
+    db_user = await get_or_create_user(target_id)
+    
+    now = datetime.now(timezone.utc)
+    if db_user.get("subscription_expires_at"):
+        current_exp = datetime.fromisoformat(db_user["subscription_expires_at"])
+        if current_exp < now: current_exp = now
+    else:
+        current_exp = now
+        
+    new_exp = current_exp + timedelta(days=days)
+    
+    import aiosqlite
+    from core.db import DB_PATH
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET subscription_expires_at = ? WHERE user_id = ?",
+                       (new_exp.isoformat(), target_id))
+        await db.commit()
+    await update.message.reply_text(f"✅ Granted {days} days to {target_id}. Expires: {new_exp.strftime('%Y-%m-%d')}")
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != config["telegram"]["admin_user_id"]: return
+    try:
+        target_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /revoke <user_id>")
+        return
+    
+    import aiosqlite
+    from core.db import DB_PATH
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET subscription_expires_at = NULL WHERE user_id = ?", (target_id,))
+        await db.commit()
+    await update.message.reply_text(f"✅ Revoked subscription for {target_id}.")
+
 # ─────────────────────────── Error handler ───────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -1586,7 +1681,7 @@ async def main_async():
 
     for cmd, handler in [
         ("start", start), ("help", help_command), ("subscribe", subscribe_command),
-        ("verify", verify_command), ("status", status_command),
+        ("status", status_command),
         ("degenflow", degenflow_command), ("flow", degenflow_command),
         ("new", degenflow_command), ("newtoken", degenflow_command),
         ("newtokens", degenflow_command), ("radar", degenflow_command),
@@ -1596,6 +1691,9 @@ async def main_async():
         ("wallet", wallet_command),
         ("trust", trust_command),
         ("compare", compare_command),
+        ("terms", terms_command),
+        ("grant", grant_command),
+        ("revoke", revoke_command),
     ]:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(CallbackQueryHandler(button_callback))
