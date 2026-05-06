@@ -395,8 +395,8 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         score -= 2.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    # ---- Age ----
-    if age_hours != 999:
+    # ---- Age (STRICT: only apply if we actually have the data) ----
+    if age_hours is not None and age_hours != 999:
         if age_hours < 1:
             score += 2.0
             flags.append('Brand new (<1 hour)')
@@ -409,10 +409,6 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         elif age_hours > 4320:  # 180 days
             score -= 2.0
             flags.append('Long track record (180+ days)')
-        elif age_hours > 8760:  # 365 days
-            score -= 3.0
-            # Already flagged above; just adjust
-            pass
 
     # ---- Holder concentration (only if data available) ----
     if top10_pct is not None:
@@ -767,11 +763,6 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     token_symbol = escape_html(evm_token_symbol)
 
     age_str = risk.get('age_str', '?')
-    # Never show "Established" as a guess—only show real data
-    if age_str == '?' and not any('Long track record' in f for f in risk.get('flags', [])):
-        age_str = '?'
-    elif age_str == 'Established (exact age unavailable)':
-        age_str = '?'
 
     lines = [
         f"<b>{token_name} ({token_symbol})</b>",
