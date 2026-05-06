@@ -202,24 +202,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_color = "🔴"
 
     name = escape_html(user.first_name or 'trader')
-    msg = (
-        f"<b>🛡️ A E G I S</b>\n"
+    text = (
+        f"🛡️ <b>AEGIS PREMIUM DASHBOARD</b>\n"
         f"<i>Your multi‑chain security edge</i>\n\n"
-        f"{status_color} <b>{escape_html(status)}</b>\n\n"
-        f"Welcome, {name}. What would you like to do?"
+        f"📈 <b>Market Pulse:</b> Solana & EVM Trending\n"
+        f"🏥 <b>Portfolio Health:</b> AI Wallet Audit\n"
+        f"🧠 <b>Entity Intelligence:</b> Deployer Forensics\n\n"
+        f"🛡️ <b>AEGIS VERIFIED:</b> {status_color} {escape_html(status)}\n\n"
+        f"Welcome back, {name}. System status: NOMINAL."
     )
     keyboard = [
         [InlineKeyboardButton("🔍 Scan Contract", callback_data="cmd_scan_prompt"),
          InlineKeyboardButton("⚠️ DEGEN FLOW", callback_data="cmd_degenflow")],
         [InlineKeyboardButton("💼 Wallet Audit", callback_data="cmd_wallet_prompt"),
          InlineKeyboardButton("🕵️ Deployer Check", callback_data="cmd_deployer_prompt")],
-        [InlineKeyboardButton("📄 Sample Report", callback_data="sample_scan")],
+        [InlineKeyboardButton("🤝 Trust Center", callback_data="cmd_trust"),
+         InlineKeyboardButton("📊 Compare", callback_data="cmd_compare")],
+        [InlineKeyboardButton("📋 Help Center", callback_data="cmd_help"),
+         InlineKeyboardButton("💳 Status", callback_data="cmd_status")],
     ]
     if reason != "subscribed" and reason != "trial":
-        keyboard.append([InlineKeyboardButton("💎 Subscribe $14.99/mo", callback_data="cmd_subscribe")])
-    keyboard.append([InlineKeyboardButton("📋 Help", callback_data="cmd_help"),
-                     InlineKeyboardButton("💳 Status", callback_data="cmd_status")])
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        keyboard.insert(3, [InlineKeyboardButton("💎 Subscribe $14.99/mo", callback_data="cmd_subscribe")])
+        
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 async def help_command(update, context):
     if not await _require_private_chat(update): return
@@ -265,38 +270,62 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"2️⃣ After sending, use: <code>/verify &lt;transaction_signature&gt;</code>\n\n"
         f"<i>Note:</i> 60% burned 🔥, 40% to treasury 💰"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private_chat(update): return
     args = context.args
     if not args: await update.message.reply_text("Usage: /verify <tx_signature>"); return
     signature = args[0].strip(); user_id = update.effective_user.id
-    msg = await update.message.reply_text("⏳ Verifying transaction on Solana...")
+    msg = await update.message.reply_text("⌛ Verifying transaction on Solana...")
     result = await process_verification(user_id, signature)
     if not result["success"]:
         await msg.edit_text(f"❌ Verification failed: {escape_html(result['error'])}", parse_mode="HTML"); return
     expires = result["expires_at"].strftime("%Y-%m-%d")
     split_info = f"\nSplit tx: <code>{escape_html(result['split_tx'])}</code>" if result.get("split_tx") else ""
     await msg.edit_text(
-        f"<b>✅ Payment verified!</b>\nSubscription active until <b>{escape_html(expires)}</b>.\n"
+        f"❅ \u003cb\u003ePayment verified!\u003c/b\u003e\nSubscription active until \u003cb\u003e{escape_html(expires)}\u003c/b\u003e.\n"
         f"60% burned 🔥, 40% to treasury 💰{split_info}", parse_mode="HTML"
     )
     if config["telegram"]["admin_user_id"]:
         try: await context.bot.send_message(config["telegram"]["admin_user_id"], f"💰 New subscription: User {user_id} paid for 30 days.")
         except Exception: pass
 
-# ───────────────────── Degen Flow Deterministic Scoring ──────────────────────
+async def trust_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The Aegis Trust Manifesto."""
+    text = (
+        "🛡️ <b>THE AEGIS TRUST MANIFESTO</b>\n\n"
+        "1️⃣ <b>Objective Reality:</b> We don't believe in 'Safe' lists. We believe in data. Every token starts at 0.0 risk and earns its score through verifiable on‑chain history.\n\n"
+        "2️⃣ <b>Transparency:</b> Every point in an Aegis Score is explained. If a token is risky, we tell you exactly why (unlocked LP, live authorities, or concentrated supply).\n\n"
+        "3️⃣ <b>Neutrality:</b> We are not a marketing platform. We are a security filter. Our goal is to be the 'Casino Bouncer' for your portfolio.\n\n"
+        "<i>AEGIS VERIFIED — Data. Not Hype.</i>"
+    )
+    if update.message:
+        await update.message.reply_text(text, parse_mode="HTML")
+    else:
+        await update.callback_query.message.edit_text(text, parse_mode="HTML")
+
+async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """How Aegis compares to others."""
+    text = (
+        "📊 <b>AEGIS VS. THE MARKET</b>\n\n"
+        "🔹 <b>Traditional Bots:</b> Hostile defaults, origin-biased, often pay-to-play 'safe' lists.\n"
+        "🔸 <b>Aegis SaaS:</b> Objective additive scoring, chain-agnostic, zero-bias audits.\n\n"
+        "We prioritize <b>Tokenomics</b> (Bag Alerts) and <b>Authority Status</b> because code can be obfuscated, but on‑chain distribution and control never lie."
+    )
+    if update.message:
+        await update.message.reply_text(text, parse_mode="HTML")
+    else:
+        await update.callback_query.message.edit_text(text, parse_mode="HTML")
+
+# ───────────────────── Degen Flow Objective Scoring ──────────────────────
 
 async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> dict:
-    """Hard rules for Solana. Tokenomics first. Uses Helius + RugCheck + DexScreener."""
-    is_pump = ca.endswith('pump')
-
+    """Objective Solana scoring – additive model starting from 0."""
     rugcheck   = raw.get('rugcheck', {}) or {}
     mint_info  = raw.get('mint_info', {}) or {}
     holders    = raw.get('holders', [])
 
-    # ── Liquidity: always fetch fresh from DexScreener ─────────────────
+    # ── Fetch liquidity + age from DexScreener ─────────────────────────
     liq = 0.0
     age_hours = 999
     try:
@@ -318,151 +347,150 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     mint_revoked = mint_info.get('mint_authority') is None
     freeze_revoked = mint_info.get('freeze_authority') is None
 
-    # ── Holder concentration ──────────────────────────────────────────
-    top10_pct = 100.0
+    # ── Holder concentration (if available) ────────────────────────────
+    top10_pct = None
     holder_count = len(holders)
+    dev_pct = None
+
+    # Fallback to RugCheck holder count if Helius fails (common for massive tokens like USDC)
+    total_holders = rugcheck.get('total_holder_count') or rugcheck.get('totalHolders') or 0
+    if total_holders and not holders:
+        holder_count = int(total_holders)
+
     if holders:
         top10_pct = sum(h.get('percentage', 0) for h in holders[:10])
-    dev_pct = holders[0].get('percentage', 100.0) if holders else 100.0
+        dev_pct = holders[0].get('percentage', None) if holders else None
 
     # ── LP lock from RugCheck ─────────────────────────────────────────
     lp_locked = False
     lp_lock_days = 0
     locks = rugcheck.get('locks', [])
     if locks:
-        max_lock = max(locks, key=lambda x: x.get('unlockDate', 0))
+        max_lock = max(locks, key=lambda x: x.get("unlockDate", 0))
         unlock_ts = (max_lock.get('unlockDate') or 0) / 1000
         if unlock_ts > datetime.now(timezone.utc).timestamp():
             lp_locked = True
             lp_lock_days = int((unlock_ts - datetime.now(timezone.utc).timestamp()) / 86400)
 
-    # ── Layer 1: Structural Trust (objective on‑chain metrics) ──────────
-    trusted_by_age       = (age_hours > 4320 and age_hours != 999)   # >180 days
-    trusted_by_liquidity = (liq > 1_000_000)                         # >$1M
-    trusted_by_holders   = (holder_count > 1000 and top10_pct < 30)  # widely distributed
-
-    if trusted_by_age and trusted_by_liquidity and trusted_by_holders:
-        code_parts = []
-        if is_pump: code_parts.append('Pump.fun')
-        code_parts.append('Mint: Revoked' if mint_revoked else 'Mint: LIVE (by design)')
-        code_parts.append('Freeze: Revoked' if freeze_revoked else 'Freeze: LIVE (by design)')
-        return {
-            'score': 2.0,
-            'label': 'LOW RISK – VERIFIED BY ON‑CHAIN HISTORY',
-            'code_summary': ' | '.join(code_parts),
-            'bag_alert': f'Top10 hold {top10_pct:.0f}% — widely distributed',
-            'age_str': f"{int(age_hours)}h" if age_hours < 72 else f"{int(age_hours/24)}d",
-            'liq_str': f"${liq:,.0f}",
-            'lp_status': 'Verified by history',
-            'main_risk': 'Established asset. Mint/freeze authorities are live by design for regulated tokens.',
-            'recommendation': 'LOW RISK – Verified by on‑chain metrics',
-            'flags': []
-        }
-
-    # ── RULE 1: $0 LIQ = 10/10 INSTANT RUG ─────────────────────────────
-    if liq == 0:
-        return {
-            'score': 10.0,
-            'label': 'INSTANT RUG – UNSWAPPABLE',
-            'code_summary': 'No liquidity pool exists',
-            'bag_alert': 'Cannot sell – LIQ $0',
-            'age_str': f"{int(age_hours)}h" if age_hours < 999 else "?",
-            'liq_str': '$0',
-            'lp_status': 'None',
-            'main_risk': 'Zero liquidity. Any buy = 100% loss.',
-            'recommendation': 'AVOID – Unsellable',
-            'flags': ['Zero liquidity', 'Instant -100% on buy']
-        }
-
-    # ── Base score ─────────────────────────────────────────────────────
-    score = 8.0 if is_pump else 5.0
-    label = 'HIGH RISK – STANDARD PUMP.FUN ODDS' if is_pump else 'MODERATE-HIGH RISK – NEW TOKEN'
+    # ── Additive scoring – start from 0 ───────────────────────────────
+    score = 0.0
     flags = []
+
+    # ── Base‑rate adjustment for Pump.fun origin ────────────────────────
+    is_pump = ca.endswith('pump')
     if is_pump:
-        flags.append('Pump.fun origin – 99.6% fail rate')
-
-    # ── Tokenomics penalties ───────────────────────────────────────────
-    if dev_pct > 40:
         score += 2.0
-        flags.append(f'DEV OWNS {dev_pct:.0f}% – Rug risk extreme')
-        label = 'EXTREME RISK – DEV DOMINANT'
-    elif dev_pct > 20:
+
+    # ---- Liquidity ----
+    if liq == 0:
+        score += 10.0
+        flags.append('Zero liquidity – cannot sell')
+    elif liq < 10_000:
+        score += 3.0
+        flags.append(f'Very thin liquidity (${liq:,.0f})')
+    elif liq < 100_000:
         score += 1.0
-        flags.append(f'Dev holds {dev_pct:.0f}%')
+        flags.append(f'Low liquidity (${liq:,.0f})')
+    elif liq > 1_000_000:
+        score -= 2.0
+        flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    if top10_pct > 70:
-        score += 1.5
-        flags.append(f'MAJORITY SUPPLY RISK: Top10 hold {top10_pct:.0f}%')
-        label = 'EXTREME RISK – CONCENTRATED'
-    elif top10_pct > 50:
-        score += 1.0
-        flags.append(f'High concentration: Top10 hold {top10_pct:.0f}%')
+    # ---- Age ----
+    if age_hours != 999:
+        if age_hours < 1:
+            score += 2.0
+            flags.append('Brand new (<1 hour)')
+        elif age_hours < 24:
+            score += 1.5
+            flags.append(f'Very new ({int(age_hours)}h)')
+        elif age_hours < 720:   # 30 days
+            score += 0.5
+            flags.append(f'Less than 30 days old')
+        elif age_hours > 4320:  # 180 days
+            score -= 2.0
+            flags.append('Long track record (180+ days)')
+        elif age_hours > 8760:  # 365 days
+            score -= 3.0
+            # Already flagged above; just adjust
+            pass
 
-    if not lp_locked:
-        score += 1.5
-        flags.append('LP UNLOCKED – Dev can rug liquidity')
-        label = 'EXTREME RISK – LP UNLOCKED'
-    elif lp_lock_days < 30:
-        score += 0.5
-        flags.append(f'LP lock only {lp_lock_days} days')
+    # ---- Holder concentration (only if data available) ----
+    if top10_pct is not None:
+        if top10_pct > 70:
+            score += 3.0
+            flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 50:
+            score += 1.0
+            flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct < 30:
+            score -= 1.0
+            flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
 
+    # ---- LP lock ----
+    if not lp_locked and not mint_revoked and not freeze_revoked:
+        # LP unlocked but authorities are also live – this is normal for managed tokens
+        # Don't penalise; just note it
+        pass
+    elif not lp_locked:
+        score += 3.0
+        flags.append('LP unlocked – liquidity can be removed')
+    elif lp_lock_days > 180:
+        score -= 1.0
+        flags.append(f'LP locked for {lp_lock_days}d')
+
+    # ---- Authorities ----
     if not mint_revoked:
-        score += 1.0
-        flags.append('MINT AUTHORITY LIVE – Unlimited supply risk')
+        score += 2.0
+        flags.append('Mint authority live – supply can be increased')
+    else:
+        score -= 1.0
+        flags.append('Mint authority revoked')
+
     if not freeze_revoked:
-        score += 1.0
-        flags.append('FREEZE AUTHORITY LIVE – Dev can freeze trades')
+        score += 2.0
+        flags.append('Freeze authority live – tokens can be frozen')
+    else:
+        score -= 1.0
+        flags.append('Freeze authority revoked')
 
-    if age_hours < 1:
-        score += 1.0
-        flags.append('Brand new <1hr – No history')
-    if liq < 10000:
-        score += 1.0
-        flags.append(f'Low liquidity ${liq:,.0f} – High volatility')
-    if holder_count < 50:
-        score += 0.5
-        flags.append(f'Only {holder_count} holders')
+    # ---- Final clamping ----
+    score = max(0.0, min(10.0, score))
 
-    score = min(10.0, score)
-    if score >= 9.0:
+    # ---- Label ----
+    if liq == 0:
+        label = 'INSTANT RUG – UNSWAPPABLE'
+    elif score >= 9.0:
         label = 'EXTREME RISK – LIKELY RUG'
-    elif score >= 7.0 and 'EXTREME' not in label:
+    elif score >= 7.0:
         label = 'HIGH RISK – DEGEN GAMBLE'
-    elif score >= 6.0:
-        label = 'GRADUATED BUT DANGEROUS'
+    elif score >= 5.0:
+        label = 'ELEVATED RISK – SPECULATIVE'
+    elif score >= 3.0:
+        label = 'MODERATE RISK – NEW TOKEN'
+    elif score <= 1.0:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
+    else:
+        label = 'LOW RISK – ESTABLISHED ASSET'
 
-    # ── Build summaries ─────────────────────────────────────────────────
-    code_parts = []
-    if is_pump: code_parts.append('Pump.fun')
+    # ---- Build summaries ----
+    code_parts = ['Pump.fun' if ca.endswith('pump') else 'SPL Token']
     code_parts.append('Mint: Revoked' if mint_revoked else 'Mint: LIVE')
     code_parts.append('Freeze: Revoked' if freeze_revoked else 'Freeze: LIVE')
-    code_summary = ' | '.join(code_parts) or 'Authorities unknown'
+    code_summary = ' | '.join(code_parts)
 
-    if dev_pct > 40:
-        bag_alert = f'DEV OWNS {dev_pct:.0f}% – BAG HOLDER ALERT'
-    elif top10_pct > 50:
-        bag_alert = f'MAJORITY SUPPLY RISK: Top10 {top10_pct:.0f}%'
-    else:
+    if holders:
         bag_alert = f'Top10: {top10_pct:.0f}% | Holders: {holder_count}'
-
-    lp_status = f"Locked {lp_lock_days}d" if lp_locked else "Unlocked"
-    liq_str = f"${liq:,.0f}"
-    age_str = f"{int(age_hours)}h" if age_hours < 72 else f"{int(age_hours/24)}d"
-
-    if not lp_locked:
-        main_risk = 'LP unlocked – liquidity can be pulled anytime'
-    elif dev_pct > 40:
-        main_risk = f'Dev wallet controls {dev_pct:.0f}% of supply'
-    elif not mint_revoked:
-        main_risk = 'Mint authority live – supply can be inflated'
+    elif holder_count:
+        bag_alert = f'Total holders: {holder_count} (distribution unverified)'
     else:
-        main_risk = 'Multiple risk factors present. See flags.'
+        bag_alert = 'Holder data unavailable'
+    if liq:
+        bag_alert += f' | LIQ: ${liq:,.0f}'
 
-    recommendation = (
-        'AVOID – Risk of total loss extremely high' if score >= 8.0
-        else 'CAUTION – Only for experienced degens' if score >= 6.0
-        else 'RISKY – DYOR'
-    )
+    lp_status = f'Locked {lp_lock_days}d' if lp_locked else 'Unlocked'
+    age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours/24)}d' if age_hours < 999 else '?'
+
+    main_risk = flags[0] if flags else 'Insufficient data – see flags below'
 
     return {
         'score': round(score, 1),
@@ -470,21 +498,22 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         'code_summary': code_summary,
         'bag_alert': bag_alert,
         'age_str': age_str,
-        'liq_str': liq_str,
+        'liq_str': f'${liq:,.0f}' if liq else '$0',
         'lp_status': lp_status,
         'main_risk': main_risk,
-        'recommendation': recommendation,
+        'recommendation': '',
         'flags': flags
     }
 
+
 async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
-    """Hard rules for EVM. Tokenomics first. Fetches liquidity, age, and name from DexScreener."""
+    """Objective EVM scoring – additive model starting from 0."""
     goplus = raw.get('goplus', {}) or {}
     static = raw.get('static', {}) or {}
     slither_findings = raw.get('slither', [])
     clone_result = raw.get('clone', {})
 
-    # ----- 1. Fetch DexScreener data (liq, age, name, symbol) ---------
+    # ── DexScreener (liq, age, name) ──────────────────────────────────
     liq = 0.0
     age_hours = 999
     dex_token_name = None
@@ -507,7 +536,7 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
     except Exception:
         pass
 
-    # ----- 1b. Fallback: use Etherscan contract creation timestamp -----
+    # ── Etherscan fallback for age ─────────────────────────────────────
     if age_hours == 999:
         tx_hash = raw.get('creation', {}).get('tx_hash') or raw.get('tx_hash')
         if tx_hash:
@@ -526,146 +555,127 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
             except Exception:
                 pass
 
-    # ----- 2. GoPlus signals -------------------------------------------
+    # ── GoPlus signals ─────────────────────────────────────────────────
     honeypot = goplus.get('gp_is_honeypot', False)
-    mintable = goplus.get('gp_is_mintable', False) if goplus.get('gp_is_mintable') is not None else False
-    owner_pct = float(goplus.get('gp_owner_percent')) if goplus.get('gp_owner_percent') is not None else 100
+    mintable = goplus.get('gp_is_mintable', False) if goplus.get('gp_is_mintable') is not None else None
+    owner_pct = float(goplus.get('gp_owner_percent')) if goplus.get('gp_owner_percent') is not None else None
     lp_locked = not goplus.get('gp_cannot_sell_all', False)
     if not goplus.get('goplus_available'):
-        owner_pct = 100
-        lp_locked = False
+        owner_pct = None
+        lp_locked = None
 
-    static_checks = static.get('static_checks', {})
-    has_mint_static = static_checks.get('has_mint_function', False)
-    has_selfdestruct = static_checks.get('has_selfdestruct', False)
+    # ── Additive scoring ───────────────────────────────────────────────
+    score = 0.0
+    flags = []
 
-    actual_slither = [f for f in slither_findings if isinstance(f, dict) and not f.get('_slither_metadata')]
-    high_count = len([f for f in actual_slither if f.get('severity') == 'HIGH'])
-    low_count = len([f for f in actual_slither if f.get('severity') == 'LOW'])
-    clone_score = clone_result.get('similarity_score', 0)
-
-    # ── Layer 1: Structural Trust (objective on‑chain metrics) ──────────
-    # For EVM, holder count comes from GoPlus or on‑chain; fallback to 0
-    try:
-        evm_holder_count = int(goplus.get('gp_holder_count') or 0)
-    except (ValueError, TypeError):
-        evm_holder_count = 0
-
-    trusted_by_age       = (age_hours > 4320 and age_hours != 999)
-    trusted_by_liquidity = (liq > 1_000_000)
-    trusted_by_holders   = (evm_holder_count > 1000)
-
-    if trusted_by_age and trusted_by_liquidity and trusted_by_holders:
-        return make_risk_dict(
-            2.0,
-            'LOW RISK – VERIFIED BY ON‑CHAIN HISTORY',
-            'Mint/freeze authorities may be live by design for regulated tokens',
-            f'Holder count: {evm_holder_count} — widely distributed | LIQ: ${liq:,.0f}',
-            format_age(age_hours),
-            f'${liq:,.0f}',
-            'Verified by history',
-            'Established asset. Standard tokenomics apply.',
-            'LOW RISK – Verified by on‑chain metrics',
-            [],
-            dex_token_name,
-            dex_token_symbol
-        )
-
-    # ----- 3. Early returns --------------------------------------------
+    # Honeypot → immediate 10
     if honeypot:
         return make_risk_dict(10.0, 'CONFIRMED HONEYPOT', 'GoPlus: Honeypot detected',
-                              f'Cannot sell – Honeypot confirmed', '?', '$?', 'None',
-                              'Honeypot contract. You cannot sell.', 'AVOID – Honeypot',
+                              'Cannot sell – Honeypot confirmed', '?', '$?', 'None',
+                              'Honeypot contract. You cannot sell.', '',
                               ['GoPlus: is_honeypot = true'], dex_token_name, dex_token_symbol)
 
+    # Liquidity
     if liq == 0:
-        return make_risk_dict(10.0, 'INSTANT RUG – UNSWAPPABLE', 'No liquidity pool exists',
-                              f'Cannot sell – LIQ $0 | Owner: {owner_pct:.0f}%',
-                              format_age(age_hours),
-                              '$0', 'None',
-                              'Zero liquidity. Token exists but cannot be sold.',
-                              'AVOID – Unsellable',
-                              ['Zero liquidity', f'Owner holds {owner_pct:.0f}%'],
-                              dex_token_name, dex_token_symbol)
+        score += 10.0
+        flags.append('Zero liquidity – cannot sell')
+    elif liq < 10_000:
+        score += 3.0
+        flags.append(f'Very thin liquidity (${liq:,.0f})')
+    elif liq > 1_000_000:
+        score -= 2.0
+        flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    if owner_pct >= 90:
-        return make_risk_dict(10.0, 'INSTANT RUG – OWNER DOMINANT',
-                              f'Owner controls {owner_pct:.0f}% of supply',
-                              f'Owner: {owner_pct:.0f}% | Mintable: {mintable or has_mint_static} | LIQ: ${liq:,.0f}',
-                              format_age(age_hours),
-                              f'${liq:,.0f}',
-                              'Locked' if lp_locked else 'Unlocked',
-                              f'Owner controls {owner_pct:.0f}% – can dump entire supply instantly',
-                              'AVOID – Extreme centralization',
-                              [f'Owner holds {owner_pct:.0f}%', 'Mint function exists' if (mintable or has_mint_static) else 'Mint revoked'],
-                              dex_token_name, dex_token_symbol)
+    # ---- Age ----
+    if age_hours != 999 and isinstance(age_hours, (int, float)):
+        if age_hours < 1:
+            score += 2.0
+            flags.append('Brand new (<1 hour)')
+        elif age_hours < 24:
+            score += 1.5
+            flags.append(f'Very new ({int(age_hours)}h)')
+        elif age_hours < 720:
+            score += 0.5
+            flags.append(f'Less than 30 days old')
+        elif age_hours > 4320:
+            score -= 2.0
+            flags.append('Long track record (180+ days)')
 
-    # ----- 4. Scoring -------------------------------------------------
-    score = 6.0
-    flags = []
-    label = 'HIGH RISK – EVM TOKEN'
+    # Owner concentration (only if GoPlus returned data)
+    if owner_pct is not None:
+        if owner_pct > 40:
+            score += 2.0
+            flags.append(f'Owner holds {owner_pct:.0f}%')
+        elif owner_pct > 20:
+            score += 1.0
+            flags.append(f'Owner holds {owner_pct:.0f}%')
+        else:
+            score -= 1.0
+            flags.append(f'Owner holds only {owner_pct:.0f}%')
 
-    if owner_pct > 40:
+    # LP lock
+    if lp_locked is not None:
+        if not lp_locked:
+            score += 2.0
+            flags.append('LP unlocked – liquidity can be removed')
+
+    # Mintable
+    if mintable is True:
         score += 2.0
-        flags.append(f'Owner holds {owner_pct:.0f}% – Rug risk extreme')
-        label = 'EXTREME RISK – DEV DOMINANT'
-    elif owner_pct > 20:
-        score += 1.0
-        flags.append(f'Owner holds {owner_pct:.0f}%')
-
-    if not lp_locked:
-        score += 1.5
-        flags.append('LP UNLOCKED – Dev can rug liquidity')
-        label = 'EXTREME RISK – LP UNLOCKED'
-
-    if mintable or has_mint_static:
-        score += 1.0
         flags.append('Mint function exists – supply can be inflated')
 
-    if has_selfdestruct:
-        score += 1.5
-        flags.append('Selfdestruct present – contract can be destroyed')
-        label = 'EXTREME RISK – SELFDESTRUCT'
-
-    if high_count > 0:
-        score += 1.0
+    # ---- Slither ----
+    actual_slither = [f for f in slither_findings if isinstance(f, dict) and not f.get('_slither_metadata')]
+    high_count = len([f for f in actual_slither if f.get('severity') == 'HIGH'])
+    if high_count == 1:
+        score += 2.0
+        flags.append(f'Slither found 1 HIGH severity issue')
+    elif high_count == 2:
+        score += 3.5
+        flags.append(f'Slither found 2 HIGH severity issues')
+    elif high_count >= 3:
+        score += 5.0
         flags.append(f'Slither found {high_count} HIGH severity issues')
-    if not fast_mode and low_count > 5:
-        score += 0.5
-        flags.append(f'Deep scan: {low_count} LOW severity issues')
 
+    # Clone detection
+    clone_score = clone_result.get('similarity_score', 0)
     if clone_score > 0.6:
-        score += 1.0
+        score += 2.0
         flags.append(f'Bytecode similarity to rugs: {clone_score:.0%}')
 
-    if liq < 10000:
-        score += 1.0
-        flags.append(f'Low liquidity ${liq:,.0f} – High volatility')
-    if age_hours < 1:
-        score += 1.0
-        flags.append('Brand new <1hr – No history')
+    # Final clamping
+    score = max(0.0, min(10.0, score))
 
-    score = min(10.0, score)
-    if score >= 9.0:
+    # Label
+    if liq == 0:
+        label = 'INSTANT RUG – UNSWAPPABLE'
+    elif score >= 9.0:
         label = 'EXTREME RISK – LIKELY RUG'
     elif score >= 7.0:
         label = 'HIGH RISK – DEGEN GAMBLE'
+    elif score >= 5.0:
+        label = 'ELEVATED RISK – SPECULATIVE'
+    elif score >= 3.0:
+        label = 'MODERATE RISK – NEW TOKEN'
+    elif score <= 1.0:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
+    else:
+        label = 'LOW RISK – ESTABLISHED ASSET'
 
-    return make_risk_dict(round(score, 1), label,
-                          f"Mintable: {mintable or has_mint_static} | Owner: {owner_pct:.0f}%",
-                          f'Owner: {owner_pct:.0f}% | LP: {"Locked" if lp_locked else "Unlocked"} | LIQ: ${liq:,.0f}',
-                          format_age(age_hours),
-                          f'${liq:,.0f}',
-                          'Locked' if lp_locked else 'Unlocked',
-                          flags[0] if flags else 'Multiple risk factors present',
-                          'AVOID – High risk of loss' if score >= 8 else 'CAUTION – High risk',
-                          flags, dex_token_name, dex_token_symbol)
+    # Summaries
+    code_summary = f"Mintable: {mintable} | Owner: {owner_pct}%" if owner_pct is not None else "Tokenomics data unavailable"
+    bag_alert = f'Owner: {owner_pct:.0f}%' if owner_pct is not None else 'Owner data unavailable'
+    if liq:
+        bag_alert += f' | LIQ: ${liq:,.0f}'
+    lp_status_str = 'Locked' if lp_locked else 'Unlocked' if lp_locked is not None else 'Unknown'
+    age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours/24)}d' if age_hours < 999 else '?'
 
-
-# ----- helpers -----
-
+    return make_risk_dict(round(score, 1), label, code_summary, bag_alert,
+                          age_str, f'${liq:,.0f}' if liq else '$0', lp_status_str,
+                          flags[0] if flags else 'Insufficient data',
+                          '', flags, dex_token_name, dex_token_symbol)
 def format_age(hours: float) -> str:
-    if hours == 999:
+    if hours is None or hours == 999:
         return "?"
     if hours < 72:
         return f"{int(hours)}h"
@@ -690,7 +700,7 @@ def make_risk_dict(score, label, code_summary, bag_alert, age_str, liq_str, lp_s
 
 # ─────────────────────── Banned‑word guard ───────────────────────────────
 
-BANNED_WORDS = ['Safe', 'Low Risk', 'Moderate', 'Medium Risk',
+BANNED_WORDS = ['Safe', 'Medium Risk',
                 'Audited', 'Secure', 'Gem', 'Alpha', 'Smart Money']
 
 def sanitize_output(text: str) -> None:
@@ -756,6 +766,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     token_name = escape_html(evm_token_name)
     token_symbol = escape_html(evm_token_symbol)
 
+    age_str = risk.get('age_str', '?')
+    # If age is unknown but the token has deep liquidity and a low score, label as Established
+    if age_str == '?' and risk.get('score', 10.0) <= 2.0 and risk.get('liq_str', '$0') != '$0':
+        age_str = 'Established (exact age unavailable)'
+
     lines = [
         f"<b>{token_name} ({token_symbol})</b>",
         f"<code>{escape_html(address)}</code>",
@@ -763,7 +778,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
         f"🎰 <b>{chain.upper()} RISK: {risk['score']:.1f}/10 \"{risk['label']}\"</b>",
         f"💰 <b>BAG ALERT:</b> {risk['bag_alert']}",
         f"🔍 <b>CODE:</b> {risk['code_summary']}",
-        f"⏱️ <b>AGE:</b> {risk['age_str']} | <b>LIQ:</b> {risk['liq_str']} | <b>LP:</b> {risk['lp_status']}",
+        f"⏱️ <b>AGE:</b> {age_str} | <b>LIQ:</b> {risk['liq_str']} | <b>LP:</b> {risk['lp_status']}",
         f"🚨 <b>MAIN RISK:</b> {risk['main_risk']}",
     ]
 
@@ -974,8 +989,7 @@ async def degenflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t["is_pumpfun"] = is_pump
 
         lines = ["⚠️ <b>DEGEN FLOW — HIGH RISK</b> ⚠️",
-                 "CONTEXT: 99.6% of Pump.fun tokens fail. Scores are relative to other new launches.\n",
-                 "📝 CONTEXT: All tokens below are new launches. Assume 99% will fail regardless of liquidity.\n"]
+                 "CONTEXT: New tokens are high‑risk by default. Scores reflect on‑chain data (liquidity, holders, age).\n"]
 
         keyboard = []
         for t in tokens[:10]:
@@ -1202,84 +1216,127 @@ async def _fetch_dexscreener_latest_solana(client: httpx.AsyncClient, limit: int
 
 # ── Full risk scoring with LP + holder data ─────────────────────────────
 def _calculate_degenflow_risk_full(token: dict) -> dict:
-    """Full Degen Flow scoring with LP lock, top10%, authorities."""
+    """Full Degen Flow scoring with LP lock, top10%, authorities – additive version."""
     address = token.get("address", ""); is_pump = address.endswith("pump")
     liq = token.get("liquidity_usd", 0.0); age_min = token.get("age_minutes", 0.0)
     lp_locked = token.get("lp_locked", False); lp_status = token.get("lp_status", "Unlocked")
     top10_pct = token.get("top10_pct", 100.0); holder_count = token.get("holder_count", 0)
     mint_revoked = token.get("mint_revoked"); freeze_revoked = token.get("freeze_revoked")
+    age_hours = age_min / 60.0
 
-    # ── Layer 1: Structural Trust ─────────────────────────────────────
-    if (age_min > 4320 and liq > 1_000_000 and holder_count > 1000 and top10_pct < 30):
-        return {
-            "risk_score": 2.0,
-            "risk_label": "LOW RISK – VERIFIED BY ON‑CHAIN HISTORY",
-            "code_summary": "Mint/freeze authorities may be live by design",
-            "bag_alert": f"Top10 hold {top10_pct:.0f}% — widely distributed",
-            "main_risk": "Established asset. Standard tokenomics apply.",
-            "lp_status": "Verified by history"
-        }
+    # ── Additive scoring – start from 0 ───────────────────────────────
+    score = 0.0
+    flags = []
 
-    # RULE 1: $0 liquidity = 10/10 INSTANT RUG
+    if is_pump:
+        score += 2.0
+
+    # ---- Liquidity ----
     if liq == 0:
-        return {
-            "risk_score": 10.0, "risk_label": "INSTANT RUG – UNSWAPPABLE",
-            "code_summary": "No liquidity pool", "bag_alert": "Cannot sell – LIQ $0",
-            "main_risk": "Zero liquidity. Buying is an instant -100% loss.", "lp_status": "None"
-        }
+        score += 10.0
+        flags.append('Zero liquidity – cannot sell')
+    elif liq < 10_000:
+        score += 3.0
+        flags.append(f'Very thin liquidity (${liq:,.0f})')
+    elif liq < 100_000:
+        score += 1.0
+        flags.append(f'Low liquidity (${liq:,.0f})')
+    elif liq > 1_000_000:
+        score -= 2.0
+        flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    score = 8.0 if is_pump else 7.0
-    label = "HIGH RISK – STANDARD PUMP.FUN ODDS" if is_pump else "HIGH RISK – NEW TOKEN"
+    # ---- Age ----
+    if age_hours < 1:
+        score += 2.0
+        flags.append('Brand new (<1 hour)')
+    elif age_hours < 24:
+        score += 1.5
+        flags.append(f'Very new ({int(age_hours)}h)')
+    elif age_hours < 720:   # 30 days
+        score += 0.5
+        flags.append(f'Less than 30 days old')
+    elif age_hours > 4320:  # 180 days
+        score -= 2.0
+        flags.append('Long track record (180+ days)')
+    elif age_hours > 8760:  # 365 days
+        score -= 3.0
+        # Already flagged above; just adjust
+        pass
 
-    # CODE line
-    code_parts = []
-    if is_pump: code_parts.append("Pump.fun")
-    if mint_revoked is True: code_parts.append("Mint: Revoked")
-    elif mint_revoked is False: code_parts.append("Mint: LIVE")
-    if freeze_revoked is True: code_parts.append("Freeze: Revoked")
-    elif freeze_revoked is False: code_parts.append("Freeze: LIVE")
-    code_summary = " | ".join(code_parts) if code_parts else "LP: Unknown"
-
-    # BAG ALERT
+    # ---- Holder concentration ----
     if top10_pct > 70:
-        bag_alert = f"MAJORITY SUPPLY RISK: Top10 hold {top10_pct:.0f}%"; score = max(score, 8.5)
+        score += 3.0
+        flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
     elif top10_pct > 50:
-        bag_alert = f"HIGH CONCENTRATION: Top10 hold {top10_pct:.0f}%"; score = max(score, 7.5)
-    elif holder_count < 50:
-        bag_alert = f"FEW HOLDERS: Only {holder_count} wallets"; score = max(score, 7.0)
+        score += 1.0
+        flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+    elif top10_pct < 30:
+        score -= 1.0
+        flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
+
+    # ---- LP lock ----
+    if not lp_locked and mint_revoked is False and freeze_revoked is False:
+        # Managed token
+        pass
+    elif not lp_locked:
+        score += 3.0
+        flags.append('LP unlocked – liquidity can be removed')
     else:
-        bag_alert = f"Top10 hold {top10_pct:.0f}% | {holder_count} holders"
+        try:
+            days = int(token.get("lp_lock_days", 0))
+            if days > 180:
+                score -= 1.0
+                flags.append(f'LP locked for {days}d')
+        except:
+            pass
 
-    # LP Lock penalty
-    if not lp_locked:
-        score += 1.0; label = "EXTREME RISK – LP UNLOCKED"
-        if "Unlocked" in lp_status: bag_alert += " | LP UNLOCKED"
+    # ---- Authorities ----
+    if mint_revoked is False:
+        score += 2.0
+        flags.append('Mint authority live – supply can be increased')
+    elif mint_revoked is True:
+        score -= 1.0
+        flags.append('Mint authority revoked')
 
-    # Graduated Pump.fun check
-    if is_pump and liq > 0:
-        score = max(6.0, score - 1.0)
-        if "EXTREME" not in label: label = "GRADUATED BUT DANGEROUS"
+    if freeze_revoked is False:
+        score += 2.0
+        flags.append('Freeze authority live – tokens can be frozen')
+    elif freeze_revoked is True:
+        score -= 1.0
+        flags.append('Freeze authority revoked')
 
-    # Age penalty
-    if age_min < 60:
-        score = max(score, 7.0)
-        if "GRADUATED" not in label and "EXTREME" not in label: label = "HIGH RISK – BRAND NEW"
+    # ---- Final clamping ----
+    score = max(0.0, min(10.0, score))
 
-    # Low liquidity penalty
-    if 0 < liq < 10000: score = max(score, 7.5)
-    elif liq < 30000: score = max(score, 6.5)
+    # ---- Label ----
+    if liq == 0:
+        label = 'INSTANT RUG – UNSWAPPABLE'
+    elif score >= 9.0:
+        label = 'EXTREME RISK – LIKELY RUG'
+    elif score >= 7.0:
+        label = 'HIGH RISK – DEGEN GAMBLE'
+    elif score >= 5.0:
+        label = 'ELEVATED RISK – SPECULATIVE'
+    elif score >= 3.0:
+        label = 'MODERATE RISK – NEW TOKEN'
+    elif score <= 1.0:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
+    else:
+        label = 'LOW RISK – ESTABLISHED ASSET'
 
-    # Authority penalty
-    if mint_revoked is False or freeze_revoked is False:
-        score += 0.5; label = "EXTREME RISK – AUTHORITIES LIVE"
+    # ---- Build summaries ----
+    code_parts = ['Pump.fun' if is_pump else 'SPL Token']
+    if mint_revoked is True: code_parts.append('Mint: Revoked')
+    elif mint_revoked is False: code_parts.append('Mint: LIVE')
+    if freeze_revoked is True: code_parts.append('Freeze: Revoked')
+    elif freeze_revoked is False: code_parts.append('Freeze: LIVE')
+    code_summary = ' | '.join(code_parts)
 
-    score = min(10.0, score)
+    bag_alert = f'Top10: {top10_pct:.0f}% | Holders: {holder_count}'
+    if liq:
+        bag_alert += f' | LIQ: ${liq:,.0f}'
 
-    # Main risk
-    if not lp_locked: main_risk = "LP unlocked – dev can pull liquidity anytime"
-    elif top10_pct > 50: main_risk = f"Top 10 wallets own {top10_pct:.0f}% – dump risk extreme"
-    elif is_pump: main_risk = "Pump.fun base odds. 99.6% fail before graduation"
-    else: main_risk = "New token with unknown holder distribution"
+    main_risk = flags[0] if flags else 'New token — treat as high risk until proven otherwise'
 
     return {
         "risk_score": round(score, 1), "risk_label": label, "code_summary": code_summary,
@@ -1304,7 +1361,7 @@ def _main_risk_for_token(t: dict) -> str:
 
     # Still on Pump.fun bonding curve → warn about rug odds
     if is_pumpfun:
-        return "Pump.fun token – assume 99% rug odds"
+        return "New token on Pump.fun bonding curve — objective risk depends on liquidity and holders"
 
     # Graduated SPL token → warn about holder concentration
     return f"Graduated token – Top10 concentration assumed with ${liq:,.0f} liquidity"
@@ -1379,6 +1436,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_subscribe":
         await query.answer()
         await query.message.edit_text("<b>💎 Subscribe to Aegis Premium</b>\n\nTo subscribe, type /subscribe in the chat.\n\nYou'll see the live token price and the exact amount of $AEGIS to send.", parse_mode="HTML")
+    elif data == "cmd_trust":
+        await trust_command(update, context)
+    elif data == "cmd_compare":
+        await compare_command(update, context)
     elif data == "cmd_help":
         await query.answer()
         await query.message.edit_text(
@@ -1387,8 +1448,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>/deepscan &lt;address&gt; [chain]</b> — Extended analysis\n"
             "<b>/deployer &lt;address&gt;</b> — Deployer forensics\n"
             "<b>/wallet &lt;address&gt;</b> — Portfolio audit\n"
-            "<b>/degenflow</b> — Solana risk feed (aliases: /flow, /radar)\n"
-            "<b>/degenflow new</b> — Latest Solana launches with instant risk\n"
+            "<b>/degenflow</b> — Solana risk feed\n"
+            "<b>/trust</b> — The Aegis Trust Manifesto\n"
+            "<b>/compare</b> — Aegis vs. Traditional Bots\n"
             "<b>/subscribe</b> — Purchase premium\n"
             "<b>/status</b> — Check trial/subscription\n"
             "<b>/start</b> — Dashboard\n\n"
@@ -1443,7 +1505,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>{display_name} ({display_symbol})</b>",
                 f"<code>{escape_html(address)}</code>",
                 "",
-                f"🎰 <b>SOLANA RISK: {risk['score']:.1f}/10 \"{risk['label']}\"</b>",
+                f"🎰 <b>AEGIS SCORE: {risk['score']:.1f}/10 \"{risk['label']}\"</b>",
                 f"💰 <b>BAG ALERT:</b> {risk['bag_alert']}",
                 f"🔍 <b>CODE:</b> {risk['code_summary']}",
                 f"⏱️ <b>AGE:</b> {risk['age_str']} | <b>LIQ:</b> {risk['liq_str']} | <b>LP:</b> {risk['lp_status']}",
@@ -1539,6 +1601,8 @@ async def main_async():
         ("scan", lambda u, c: scan_command(u, c, True)), ("deepscan", deepscan_command),
         ("deployer", deployer_command),
         ("wallet", wallet_command),
+        ("trust", trust_command),
+        ("compare", compare_command),
     ]:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(CallbackQueryHandler(button_callback))
