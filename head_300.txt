@@ -1,0 +1,50 @@
+        return
+    try:
+        price = await payment_verifier.get_token_price()
+        required = await payment_verifier.required_tokens()
+    except Exception:
+        await update.message.reply_text("❌ Could not fetch token price. Try again later.")
+        return
+    receiver = str(payment_verifier.payment_receiver)
+    msg = (
+        f"<b>💎 Subscribe to Aegis Premium</b>\n\n"
+        f"Monthly price: <b>${config['subscription']['price_usd']:.2f}</b>\n"
+        f"Current $AEGIS price: <code>{price:.6f}</code>\n"
+        f"Tokens required: <b>{required:.2f} $AEGIS</b>\n\n"
+        f"1️⃣ Send exactly the required amount to:\n<code>{escape_html(receiver)}</code>\n\n"
+        f"2️⃣ After sending, use: <code>/verify &lt;transaction_signature&gt;</code>\n\n"
+        f"<i>Note:</i> 60% burned �    if not result["success"]:
+        await msg.edit_text(f"❌ Verification failed: {escape_html(result['error'])}", parse_mode="HTML"); return
+    expires = result["expires_at"].strftime("%Y-%m-%d")
+    split_info = f"\nSplit tx: <code>{escape_html(result['split_tx'])}</code>" if result.get("split_tx") else ""
+    await msg.edit_text(
+        f"<b>✅ Payment verified!</b>\nSubscription active until <b>{escape_html(expires)}</b>.\n"
+        f"60% burned 🔥, 40% to treasury 💰{split_info}", parse_mode="HTML"
+    )
+    if config["telegram"]["admin_user_id"]:
+        try: await context.bot.send_message(config["telegram"]["admin_user_id"], f"💰 New subscription: User {user_id} paid for 30 days.")
+        except Exception: pass
+
+# ───────────────────── Degen Flow Objective Scoring ──────────────────────
+
+async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> dict:
+    """Objective Solana scoring – additive model starting from 0."""
+    rugcheck   = raw.get('rugcheck', {}) or {}
+    mint_info  = raw.get('mint_info', {}) or {}
+    holders    = raw.get('holders', [])
+
+    # ── Fetch liquidity + age from DexScreener ─────────────────────────
+    liq = 0.0
+    age_hours = 999
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}")
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get('pairs', [])
+                if pairs:
+                    best = max(pairs, key=lambda p: float(p.get('liquidity', {}).get('usd', 0) or 0))
+                    liq = float(best.get('liquidity', {}).get('usd', 0) or 0)
+                    created_at = best.get('pairCreatedAt') or 0
+                    if created_at:
+                        age_hours = (datetime.now(timezone.utc).timestamp() - created_at / 1000) / 3600
