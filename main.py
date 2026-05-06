@@ -586,8 +586,8 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         score -= 2.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
 
-    # ---- Age ----
-    if age_hours != 999 and isinstance(age_hours, (int, float)):
+    # ---- Age (STRICT: only apply if we actually have the data) ----
+    if age_hours is not None and age_hours != 999:
         if age_hours < 1:
             score += 2.0
             flags.append('Brand new (<1 hour)')
@@ -767,9 +767,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     token_symbol = escape_html(evm_token_symbol)
 
     age_str = risk.get('age_str', '?')
-    # If age is unknown but the token has deep liquidity and a low score, label as Established
-    if age_str == '?' and risk.get('score', 10.0) <= 2.0 and risk.get('liq_str', '$0') != '$0':
-        age_str = 'Established (exact age unavailable)'
+    # Never show "Established" as a guess—only show real data
+    if age_str == '?' and not any('Long track record' in f for f in risk.get('flags', [])):
+        age_str = '?'
+    elif age_str == 'Established (exact age unavailable)':
+        age_str = '?'
 
     lines = [
         f"<b>{token_name} ({token_symbol})</b>",
