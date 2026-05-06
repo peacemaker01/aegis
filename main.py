@@ -336,6 +336,29 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
             lp_locked = True
             lp_lock_days = int((unlock_ts - datetime.now(timezone.utc).timestamp()) / 86400)
 
+    # ── Layer 1: Structural Trust (objective on‑chain metrics) ──────────
+    trusted_by_age       = (age_hours > 4320 and age_hours != 999)   # >180 days
+    trusted_by_liquidity = (liq > 1_000_000)                         # >$1M
+    trusted_by_holders   = (holder_count > 1000 and top10_pct < 30)  # widely distributed
+
+    if trusted_by_age and trusted_by_liquidity and trusted_by_holders:
+        code_parts = []
+        if is_pump: code_parts.append('Pump.fun')
+        code_parts.append('Mint: Revoked' if mint_revoked else 'Mint: LIVE (by design)')
+        code_parts.append('Freeze: Revoked' if freeze_revoked else 'Freeze: LIVE (by design)')
+        return {
+            'score': 2.0,
+            'label': 'LOW RISK – VERIFIED BY ON‑CHAIN HISTORY',
+            'code_summary': ' | '.join(code_parts),
+            'bag_alert': f'Top10 hold {top10_pct:.0f}% — widely distributed',
+            'age_str': f"{int(age_hours)}h" if age_hours < 72 else f"{int(age_hours/24)}d",
+            'liq_str': f"${liq:,.0f}",
+            'lp_status': 'Verified by history',
+            'main_risk': 'Established asset. Mint/freeze authorities are live by design for regulated tokens.',
+            'recommendation': 'LOW RISK – Verified by on‑chain metrics',
+            'flags': []
+        }
+
     # ── RULE 1: $0 LIQ = 10/10 INSTANT RUG ─────────────────────────────
     if liq == 0:
         return {
@@ -520,6 +543,33 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
     high_count = len([f for f in actual_slither if f.get('severity') == 'HIGH'])
     low_count = len([f for f in actual_slither if f.get('severity') == 'LOW'])
     clone_score = clone_result.get('similarity_score', 0)
+
+    # ── Layer 1: Structural Trust (objective on‑chain metrics) ──────────
+    # For EVM, holder count comes from GoPlus or on‑chain; fallback to 0
+    try:
+        evm_holder_count = int(goplus.get('gp_holder_count') or 0)
+    except (ValueError, TypeError):
+        evm_holder_count = 0
+
+    trusted_by_age       = (age_hours > 4320 and age_hours != 999)
+    trusted_by_liquidity = (liq > 1_000_000)
+    trusted_by_holders   = (evm_holder_count > 1000)
+
+    if trusted_by_age and trusted_by_liquidity and trusted_by_holders:
+        return make_risk_dict(
+            2.0,
+            'LOW RISK – VERIFIED BY ON‑CHAIN HISTORY',
+            'Mint/freeze authorities may be live by design for regulated tokens',
+            f'Holder count: {evm_holder_count} — widely distributed | LIQ: ${liq:,.0f}',
+            format_age(age_hours),
+            f'${liq:,.0f}',
+            'Verified by history',
+            'Established asset. Standard tokenomics apply.',
+            'LOW RISK – Verified by on‑chain metrics',
+            [],
+            dex_token_name,
+            dex_token_symbol
+        )
 
     # ----- 3. Early returns --------------------------------------------
     if honeypot:
@@ -1158,6 +1208,17 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
     lp_locked = token.get("lp_locked", False); lp_status = token.get("lp_status", "Unlocked")
     top10_pct = token.get("top10_pct", 100.0); holder_count = token.get("holder_count", 0)
     mint_revoked = token.get("mint_revoked"); freeze_revoked = token.get("freeze_revoked")
+
+    # ── Layer 1: Structural Trust ─────────────────────────────────────
+    if (age_min > 4320 and liq > 1_000_000 and holder_count > 1000 and top10_pct < 30):
+        return {
+            "risk_score": 2.0,
+            "risk_label": "LOW RISK – VERIFIED BY ON‑CHAIN HISTORY",
+            "code_summary": "Mint/freeze authorities may be live by design",
+            "bag_alert": f"Top10 hold {top10_pct:.0f}% — widely distributed",
+            "main_risk": "Established asset. Standard tokenomics apply.",
+            "lp_status": "Verified by history"
+        }
 
     # RULE 1: $0 liquidity = 10/10 INSTANT RUG
     if liq == 0:
