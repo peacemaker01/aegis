@@ -16,7 +16,6 @@ from telegram import (
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from core.config import config, logger
-from core.subscription import get_or_create_user, can_use_service
 
 # ────────────────────────── FastAPI ──────────────────────────
 app = FastAPI()
@@ -695,7 +694,7 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
 
-# ─────────────────────────── Main ──────────────────────────────────────
+# ─────────────────────────── Main ───────────────────────────────────
 async def run_fastapi_server(port: int):
     """Run FastAPI as an asyncio task alongside the bot."""
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
