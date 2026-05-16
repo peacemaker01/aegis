@@ -16,6 +16,7 @@ from telegram import (
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from core.config import config, logger
+from core.subscription import get_or_create_user, can_use_service
 
 # ────────────────────────── FastAPI ──────────────────────────
 app = FastAPI()
@@ -239,6 +240,9 @@ def format_degen_report(chain: str, address: str, result: dict) -> str:
         else:
             bag_alert = f"LIQ: ${liq:,.0f}"
 
+    flags = result.get('findings', [])
+    lp_locked = result.get('flags', {}).get('lp_locked', False)
+    age_hours = raw.get('age_hours')
     lp_status = f'Locked {lp_lock_days}d' if lp_locked else 'Unlocked'
     if age_hours is not None and age_hours != 999:
         age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours / 24)}d'
