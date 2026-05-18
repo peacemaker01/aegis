@@ -117,11 +117,7 @@ def validate_config(config: dict) -> dict:
         warnings.append("⚠️ BIRDEYE_API_KEY missing – Pump.fun Casino Feed disabled")
     if not config["cryptomus"]["merchant_id"] or not config["cryptomus"]["payment_key"]:
         warnings.append("⚠️ CRYPTOMUS keys missing – Subscription purchasing disabled")
-<<<<<<< HEAD
-    return {"errors": errors, "warnings": warnings}
-=======
     return {"errors": errors, "warnings": warnings}
 
 
 config = load_config()
->>>>>>> main
