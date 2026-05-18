@@ -11,6 +11,19 @@ class SolanaDeployerFetcher:
         self.rpc_client = rpc_client
         self.debug = debug
 
+    async def _fetch_rugcheck_holders(self, mint: str) -> Optional[int]:
+        import httpx
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+        try:
+            async with httpx.AsyncClient(timeout=4) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("totalHolders")
+        except Exception:
+            pass
+        return None
+
     async def get_deployment_history(self, deployer: str, limit: int = 150) -> List[dict]:
         """Fetch SPL token & Pump.fun launches for a Solana wallet address."""
         if self.debug:
@@ -132,6 +145,7 @@ class SolanaDeployerFetcher:
                     enrich_tasks.append(asyncio.gather(
                         self.rpc_client.get_token_metadata(mint_pubkey),
                         self.rpc_client.get_token_largest_holders(mint_pubkey, limit=10),
+                        self._fetch_rugcheck_holders(d["contract_address"]),
                         return_exceptions=True
                     ))
                 
@@ -139,12 +153,17 @@ class SolanaDeployerFetcher:
                 for idx, result in enumerate(enrich_results):
                     if isinstance(result, Exception) or not result:
                         continue
-                    meta, holders = result if len(result) == 2 else ({}, [])
+                    meta, holders, rug_holders = result if len(result) == 3 else ({}, [], None)
                     if not isinstance(meta, Exception) and meta:
                         recent[idx]["token_name"] = meta.get("name") or "Unknown SPL Token"
                         recent[idx]["token_symbol"] = meta.get("symbol") or "SPL"
-                    if not isinstance(holders, Exception) and holders:
-                        recent[idx]["holder_count"] = len(holders)
+                    
+                    h_count = 0
+                    if rug_holders is not None and not isinstance(rug_holders, Exception):
+                        h_count = rug_holders
+                    elif not isinstance(holders, Exception) and holders:
+                        h_count = len(holders)
+                    recent[idx]["holder_count"] = h_count
 
                 # Update main list
                 for idx, enriched_item in enumerate(recent):
