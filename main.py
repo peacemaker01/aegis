@@ -572,7 +572,6 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:')
     priority_flags = [f for f in risk_flags if any(f.startswith(p) for p in _priority_prefixes)]
     main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data – see flags below'))
-    main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data – see flags below')
 
     return {
         'score': round(score, 1),
@@ -774,7 +773,9 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         age_str = '?'
 
     risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
-    main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data')
+    _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:')
+    priority_flags = [f for f in risk_flags if any(f.startswith(p) for p in _priority_prefixes)]
+    main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data'))
 
     return make_risk_dict(round(score, 1), label, code_summary, bag_alert,
                           age_str, f'${liq:,.0f}' if liq else '$0', lp_status_str,
