@@ -118,3 +118,6 @@ def validate_config(config: dict) -> dict:
     if not config["cryptomus"]["merchant_id"] or not config["cryptomus"]["payment_key"]:
         warnings.append("⚠️ CRYPTOMUS keys missing – Subscription purchasing disabled")
     return {"errors": errors, "warnings": warnings}
+
+
+config = load_config()
