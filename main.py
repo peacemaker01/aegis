@@ -398,7 +398,9 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
 
     # ── Holder concentration (if available) ────────────────────────────
     top10_pct = None
-    holder_count = len(holders)
+    # RugCheck returns top-20 holders list — always 20 entries.
+    # Use totalHolders from the report for the real count; fall back to len() only if missing.
+    holder_count = int(rugcheck.get('totalHolders', 0)) or len(holders)
     if holders:
         top10_pct = sum(h.get('percentage', 0) for h in holders[:10])
 
