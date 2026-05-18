@@ -99,6 +99,78 @@ def _build_token_keyboard(tokens: list, page: int = 0) -> list:
     if nav_row: keyboard.append(nav_row)
     return keyboard
 
+ALLOWED_RISK_LABELS = {
+    "INSTANT RUG – UNSWAPPABLE",
+    "EXTREME RISK – LIKELY RUG",
+    "EXTREME RISK – TOKENOMICS RUG",
+    "HIGH RISK – DEGEN GAMBLE",
+    "HIGH RISK – UNVERIFIED",
+    "ELEVATED RISK – SPECULATIVE",
+    "GRADUATED BUT DANGEROUS",
+    "MODERATE RISK – PROCEED WITH CARE",
+    "INSUFFICIENT DATA",
+}
+
+def _validate_and_correct_result(result: dict, raw_data: dict | None = None) -> dict:
+    """
+    Post-processing guard: catches score inversions, hallucinated labels,
+    and structural inconsistencies before any result reaches the user.
+
+    raw_data keys used (all optional):
+      lp_locked, top10_pct, age_hours, holder_count, liquidity_usd
+    """
+    if not isinstance(result, dict):
+        return result
+
+    score = result.get("risk_score")
+    label = result.get("risk_label", "")
+    flags = result.get("findings") or result.get("flags") or []
+
+    # ── 1. Clamp score to valid range ─────────────────────────────────
+    if isinstance(score, (int, float)):
+        score = max(0.0, min(10.0, float(score)))
+        result["risk_score"] = round(score, 1)
+
+    # ── 2. Reject hallucinated labels ─────────────────────────────────
+    if label and label not in ALLOWED_RISK_LABELS:
+        # Derive a safe label from the score
+        if isinstance(score, float):
+            if score >= 9.0:   result["risk_label"] = "EXTREME RISK – LIKELY RUG"
+            elif score >= 7.0: result["risk_label"] = "HIGH RISK – DEGEN GAMBLE"
+            elif score >= 5.0: result["risk_label"] = "ELEVATED RISK – SPECULATIVE"
+            else:              result["risk_label"] = "INSUFFICIENT DATA"
+        else:
+            result["risk_label"] = "INSUFFICIENT DATA"
+
+    # ── 3. Structural inversion check (requires raw_data context) ─────
+    if raw_data and isinstance(score, float):
+        lp_locked    = raw_data.get("lp_locked", False)
+        top10_pct    = raw_data.get("top10_pct") or 0
+        age_hours    = raw_data.get("age_hours") or (raw_data.get("age_minutes", 0) / 60)
+        holder_count = raw_data.get("holder_count") or 0
+        liq          = raw_data.get("liquidity_usd") or raw_data.get("liq") or 0
+
+        structural_risks = sum([
+            not lp_locked,
+            top10_pct > 50,
+            age_hours <= 48,
+            (0 < holder_count < 50),
+        ])
+
+        # If 3+ structural risks and score < 5 → something went wrong
+        if structural_risks >= 3 and score < 5.0:
+            result["risk_score"] = 5.0
+            result["risk_label"] = "HIGH RISK – UNVERIFIED"
+            result.setdefault("_validation_note", "Score raised by post-processor: structural risk floor")
+
+        # If 2+ structural risks and score < 4 → floor it
+        elif structural_risks >= 2 and score < 4.0:
+            result["risk_score"] = 4.0
+            result["_validation_note"] = "Score raised by post-processor: structural risk floor"
+
+    return result
+
+
 def format_degen_report(chain: str, address: str, result: dict) -> str:
     score = result.get('risk_score', 'N/A')
     rec = result.get('recommendation', 'CAUTION')
@@ -369,7 +441,11 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         if age_hours < 1:
             score += 2.0
             flags.append('Brand new (<1 hour)')
+<<<<<<< HEAD
         elif age_hours < 24:
+=======
+        elif age_hours <= 24:          # FIX: was < 24, misses tokens at exactly 24h
+>>>>>>> main
             score += 1.5
             flags.append(f"Very new ({int(age_hours)}h)")
         elif age_hours < 720:
@@ -378,6 +454,7 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         elif age_hours > 4320:
             score -= 1.0
             flags.append('Long track record (180+ days)')
+<<<<<<< HEAD
 
     # ---- Holder concentration (only if data available) ----
     if top10_pct is not None:
@@ -408,17 +485,66 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         flags.append(f"LP locked for {lp_lock_days}d")
 
     # ---- Authorities ----
+=======
+
+    # ---- Holder concentration (only if data available) ----
+    if top10_pct is not None:
+        if top10_pct > 80:
+            score += 4.0
+            flags.append(f'CRITICAL concentration: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 70:
+            score += 3.0
+            flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 50:
+            score += 1.0
+            flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 30:
+            score += 0.5
+            flags.append(f'Elevated concentration: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct < 30:
+            score -= 1.0
+            flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
+
+    # ---- Holder count (absolute) ----
+    # Total holder count is independent of top10% — 20 holders means
+    # a single whale sell can crater the price regardless of concentration %.
+    if 0 < holder_count < 20:
+        score += 2.0
+        flags.append(f'Critically low holder count: only {holder_count} holders')
+    elif 0 < holder_count < 50:
+        score += 1.5
+        flags.append(f'Low holder count: {holder_count} holders')
+
+    # ---- LP lock ----
+    if not lp_locked and not mint_revoked and not freeze_revoked:
+        pass   # normal for managed tokens
+    elif not lp_locked:
+        score += 3.0
+        flags.append('LP unlocked – liquidity can be removed')
+    elif lp_lock_days > 180:
+        score -= 1.0
+        flags.append(f"LP locked for {lp_lock_days}d")
+
+    # ---- Authorities ----
+    # Revoked authorities are baseline hygiene — grant only a small credit
+    # so they cannot cancel out genuine risk signals like unlocked LP or age.
+>>>>>>> main
     if not mint_revoked:
         score += 2.0
         flags.append('Mint authority live – supply can be increased')
     else:
+<<<<<<< HEAD
         score -= 1.0
+=======
+        score -= 0.25   # FIX: was -1.0, too much credit
+>>>>>>> main
         flags.append('Mint authority revoked')
 
     if not freeze_revoked:
         score += 2.0
         flags.append('Freeze authority live – tokens can be frozen')
     else:
+<<<<<<< HEAD
         score -= 1.0
         flags.append('Freeze authority revoked')
 
@@ -432,6 +558,35 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     # ---- Final clamping ----
     score = max(0.0, min(10.0, score))
 
+=======
+        score -= 0.25   # FIX: was -1.0
+        flags.append('Freeze authority revoked')
+
+    # ---- Floor Rules ----
+    # Rule 1: New token (≤48h) with unlocked LP cannot score below 5.0
+    if age_hours is not None and age_hours != 999 and age_hours <= 48 and not lp_locked:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: New token with unlocked LP — minimum HIGH RISK')
+
+    # Rule 2: LP unlocked + top10 >50% → minimum 4.0
+    if not lp_locked and top10_pct is not None and top10_pct > 50:
+        if score < 4.0:
+            score = 4.0
+            flags.append('Structural floor: Unlocked LP + concentrated holders')
+
+    # ---- Final clamping ----
+    score = max(0.0, min(10.0, score))
+
+    # ---- Structural risk count (prevents misleadingly low labels) ----
+    _structural_risks = sum([
+        not lp_locked,
+        (top10_pct or 0) > 50,
+        (age_hours or 999) <= 48,
+        (0 < holder_count < 50),
+    ])
+
+>>>>>>> main
     # ---- Label ----
     if liq == 0:
         label = 'INSTANT RUG – UNSWAPPABLE'
@@ -441,10 +596,18 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         label = 'HIGH RISK – DEGEN GAMBLE'
     elif score >= 5.0:
         label = 'ELEVATED RISK – SPECULATIVE'
+<<<<<<< HEAD
     elif score >= 3.0:
         label = 'MODERATE RISK'
     elif score >= 2.0:
         label = 'CAUTION – MIXED SIGNALS'
+=======
+    elif _structural_risks >= 2:
+        # 2+ structural risk factors → never show a reassuring label
+        label = 'HIGH RISK – UNVERIFIED'
+    elif score >= 2.5:
+        label = 'MODERATE RISK – PROCEED WITH CARE'
+>>>>>>> main
     elif score >= 1.0:
         label = 'LOW RISK – ESTABLISHED ASSET'
     else:
@@ -464,13 +627,22 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         bag_alert += f' | LIQ: ${liq:,.0f}'
 
     lp_status = f'Locked {lp_lock_days}d' if lp_locked else 'Unlocked'
+<<<<<<< HEAD
     # age_hours == 999 is our sentinel for "unknown". Never display it as a real age.
+=======
+>>>>>>> main
     if age_hours is not None and age_hours != 999:
         age_str = f'{int(age_hours)}h' if age_hours < 72 else f'{int(age_hours / 24)}d'
     else:
         age_str = '?'
 
     risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
+<<<<<<< HEAD
+=======
+    _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:')
+    priority_flags = [f for f in risk_flags if any(f.startswith(p) for p in _priority_prefixes)]
+    main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data – see flags below'))
+>>>>>>> main
     main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data – see flags below')
 
     return {
@@ -629,13 +801,28 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
 
     # ---- Floor Rule ----
     if not lp_locked and owner_pct is not None and owner_pct > 40:
+<<<<<<< HEAD
         if score < 3.0:
             score = 3.0
             flags.append('Structural floor: Unlocked LP + High concentration')
+=======
+        if score < 4.0:
+            score = 4.0
+            flags.append('Structural floor: Unlocked LP + concentrated holders')
+>>>>>>> main
 
     # Final clamping
     score = max(0.0, min(10.0, score))
 
+<<<<<<< HEAD
+=======
+    # ---- Structural risk count ----
+    _structural_risks = sum([
+        not lp_locked,
+        (owner_pct or 0) > 40,
+    ])
+
+>>>>>>> main
     # Label
     if liq == 0:
         label = 'INSTANT RUG – UNSWAPPABLE'
@@ -645,10 +832,17 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         label = 'HIGH RISK – DEGEN GAMBLE'
     elif score >= 5.0:
         label = 'ELEVATED RISK – SPECULATIVE'
+<<<<<<< HEAD
     elif score >= 3.0:
         label = 'MODERATE RISK'
     elif score >= 2.0:
         label = 'CAUTION – MIXED SIGNALS'
+=======
+    elif _structural_risks >= 2:
+        label = 'HIGH RISK – UNVERIFIED'
+    elif score >= 2.5:
+        label = 'MODERATE RISK – PROCEED WITH CARE'
+>>>>>>> main
     elif score >= 1.0:
         label = 'LOW RISK – ESTABLISHED ASSET'
     else:
@@ -1245,7 +1439,11 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
     if age_hours < 1:
         score += 2.0
         flags.append('Brand new (<1 hour)')
+<<<<<<< HEAD
     elif age_hours < 24:
+=======
+    elif age_hours <= 24:
+>>>>>>> main
         score += 1.5
         flags.append(f'Very new ({int(age_hours)}h)')
     elif age_hours < 720:   # 30 days
@@ -1288,6 +1486,7 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
         except:
             pass
 
+<<<<<<< HEAD
     # ---- Authorities ----
     if mint_revoked is False:
         score += 2.0
@@ -1338,12 +1537,99 @@ def _calculate_degenflow_risk_full(token: dict) -> dict:
     elif freeze_revoked is False: code_parts.append('Freeze: LIVE')
     code_summary = ' | '.join(code_parts)
 
+=======
+    # ---- Holder count (absolute) ----
+    # Low total holder count is an independent concentration risk signal.
+    # < 50 holders = very early / whale-dominated regardless of top10 %.
+    if 0 < holder_count < 20:
+        score += 2.0
+        flags.append(f'Critically low holder count: only {holder_count} holders')
+    elif 0 < holder_count < 50:
+        score += 1.5
+        flags.append(f'Low holder count: {holder_count} holders')
+
+    # ---- Authorities ----
+    # Mint/freeze revoked is baseline hygiene in Solana — expected on any legitimate token.
+    # Grant only a small credit (-0.25 each) so it cannot cancel genuine risk signals.
+    if mint_revoked is False:
+        score += 2.0
+        flags.append('Mint authority live – supply can be increased')
+    elif mint_revoked is True:
+        score -= 0.25
+        flags.append('Mint authority revoked')
+
+    if freeze_revoked is False:
+        score += 2.0
+        flags.append('Freeze authority live – tokens can be frozen')
+    elif freeze_revoked is True:
+        score -= 0.25
+        flags.append('Freeze authority revoked')
+
+    # ---- Floor Rules ----
+    # Rule 1: New token (<48h) with unlocked LP cannot score below 5.0
+    if age_hours <= 48 and not lp_locked:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: New token with unlocked LP — minimum HIGH RISK')
+
+    # Rule 2: Unlocked LP + top10 >50% cannot score below 4.0
+    if not lp_locked and top10_pct > 50:
+        if score < 4.0:
+            score = 4.0
+            flags.append('Structural floor: Unlocked LP + concentrated holders')
+
+    # ---- Final clamping ----
+    score = max(0.0, min(10.0, score))
+
+    # ---- Structural risk count (prevents misleadingly low labels) ----
+    _structural_risks = sum([
+        not lp_locked,
+        top10_pct > 50,
+        age_hours <= 48,
+        (0 < holder_count < 50),
+    ])
+
+    # ---- Label ----
+    if liq == 0:
+        label = 'INSTANT RUG – UNSWAPPABLE'
+    elif score >= 9.0:
+        label = 'EXTREME RISK – LIKELY RUG'
+    elif score >= 7.0:
+        label = 'HIGH RISK – DEGEN GAMBLE'
+    elif score >= 5.0:
+        label = 'ELEVATED RISK – SPECULATIVE'
+    elif _structural_risks >= 2:
+        # 2+ structural risk factors → never show low-risk label regardless of score
+        label = 'HIGH RISK – UNVERIFIED'
+    elif score >= 2.5:
+        label = 'MODERATE RISK – PROCEED WITH CARE'
+    elif score >= 1.0:
+        label = 'LOW RISK – ESTABLISHED ASSET'
+    else:
+        label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
+
+    # ---- Build summaries ----
+    code_parts = ['Pump.fun' if is_pump else 'SPL Token']
+    if mint_revoked is True: code_parts.append('Mint: Revoked')
+    elif mint_revoked is False: code_parts.append('Mint: LIVE')
+    if freeze_revoked is True: code_parts.append('Freeze: Revoked')
+    elif freeze_revoked is False: code_parts.append('Freeze: LIVE')
+    code_summary = ' | '.join(code_parts)
+
+>>>>>>> main
     bag_alert = f'Top10: {top10_pct:.0f}% | Holders: {holder_count}'
     if liq:
         bag_alert += f' | LIQ: ${liq:,.0f}'
 
     risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
+<<<<<<< HEAD
     main_risk = risk_flags[0] if risk_flags else (flags[0] if flags else 'New token — treat as high risk until proven otherwise')
+=======
+    # Prioritise the most dangerous flag: critically low holders > LP unlocked > others
+    _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:')
+    priority_flags = [f for f in risk_flags if any(f.startswith(p) for p in _priority_prefixes)]
+    main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else (flags[0] if flags else 'New token — treat as high risk until proven otherwise'))
+>>>>>>> main
 
     return {
         "risk_score": round(score, 1), "risk_label": label, "code_summary": code_summary,
@@ -1699,11 +1985,30 @@ async def main_async():
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
 
+<<<<<<< HEAD
     # ── Manually initialise and start the bot (no run_polling) ─────────────
     logger.info("Starting Aegis Telegram Bot…")
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+=======
+    # ── Dynamic Webhook or Polling mode ─────────────────────────────────────
+    logger.info("Starting Aegis Telegram Bot…")
+    await application.initialize()
+    await application.start()
+
+    import sys
+    force_polling = os.getenv("FORCE_POLLING", "false").lower() == "true" or "--polling" in sys.argv
+    webhook_url = config.get("webhook", {}).get("base_url", "")
+    if webhook_url and "localhost" not in webhook_url and "127.0.0.1" not in webhook_url and not force_polling:
+        webhook_path = f"{webhook_url.rstrip('/')}/webhook"
+        logger.warning(f"Setting Telegram Webhook to: {webhook_path}")
+        await application.bot.set_webhook(url=webhook_path, allowed_updates=Update.ALL_TYPES)
+    else:
+        logger.warning("Starting bot in standard polling mode...")
+        await application.bot.delete_webhook()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+>>>>>>> main
 
     # ── Run FastAPI in the same event loop ─────────────────────────────────
     port = int(os.getenv("PORT", "8000"))

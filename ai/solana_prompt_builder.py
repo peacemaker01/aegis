@@ -29,13 +29,26 @@ ABSOLUTE RULES (apply to all Solana tokens):
 - LP locked <30 days: RISK minimum 7/10 "LIQUIDITY UNLOCKS SOON"
 - LP burned (locked forever): positive signal but does NOT reduce risk below 4/10 for Pump.fun
 
+AGE + HOLDER HARD FLOORS (non-negotiable):
+- Token age <48h AND LP unlocked → MINIMUM score 5.0, label must be "ELEVATED RISK" or higher
+- Token age <24h AND LP unlocked → MINIMUM score 6.0, label must be "HIGH RISK" or higher
+- Total holders <50 AND LP unlocked → MINIMUM score 5.0 (thin holder base = instant whale dump risk)
+- Total holders <20 → add CRITICAL flag "Critically low holder count – single sell can crash price"
+- Mint authority revoked AND freeze authority revoked = baseline hygiene only.
+  These TWO factors combined CANNOT reduce a score by more than 0.5 total.
+  Do NOT let revoked authorities pull a score below 5.0 if other risk factors are present.
+- "CAUTION – MIXED SIGNALS" label is FORBIDDEN if ANY of these are true:
+  LP unlocked, age <30 days, top10 holders >50%, total holders <100
+
 SCORING CALIBRATION:
 1. Pump.fun, 0 liq, 10min old → 10/10 INSTANT RUG
 2. Pump.fun, $24k liq, LP burned, 10min old → 7/10 GRADUATED BUT DANGEROUS
-3. Any token, top 10 >55% → HIGH RISK (never "moderate")
-4. "No data" on critical checks = COULD BE FRESH RUG FACTORY
+3. SPL token, 24h old, LP unlocked, 20 holders, $114k liq → 7.0/10 HIGH RISK (NOT 2.5)
+4. Any token, top 10 >55% → HIGH RISK (never "moderate")
+5. "No data" on critical checks = COULD BE FRESH RUG FACTORY
 
 FORBIDDEN: Safe, Low Risk, Moderate, Gem, Alpha, Smart Money
+FORBIDDEN LABELS: "CAUTION – MIXED SIGNALS" for any token with LP unlocked or age <30 days
 
 Required output:
 {
@@ -54,13 +67,10 @@ Required output:
   "findings": [{"severity":..., "title":..., "description":...}]
 }
 
-CALIBRATION — these are not suggestions. You MUST produce these outputs for these inputs:
-| Input | Score | Label |
-|-------|-------|-------|
-| Pump.fun, $0 liq, 5min old | 10.0 | INSTANT RUG – UNSWAPPABLE |
-| Pump.fun, $24k liq, LP burned, 10min old | 7.0 | GRADUATED BUT DANGEROUS |
-| EVM, Slither clean, Owner 45%, LP unlocked | 9.5 | EXTREME RISK – TOKENOMICS RUG |
-| Deployer, 1 contract, 0 holders | 0/100 rep | INSUFFICIENT DATA |
+ALLOWED risk_label values (use ONLY these, no others):
+"INSTANT RUG – UNSWAPPABLE" | "EXTREME RISK – LIKELY RUG" | "HIGH RISK – DEGEN GAMBLE" |
+"HIGH RISK – UNVERIFIED" | "ELEVATED RISK – SPECULATIVE" | "GRADUATED BUT DANGEROUS" |
+"MODERATE RISK – PROCEED WITH CARE" | "INSUFFICIENT DATA"
 """
 
 

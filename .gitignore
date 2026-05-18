@@ -163,3 +163,4 @@ aegis.db
 aegis.db-journal
 logs/
 temp/
+__pycache__/
