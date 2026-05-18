@@ -14,7 +14,7 @@ class RugCheckClient:
 
     async def get_summary(self, mint: str) -> Dict[str, Any]:
         """Fetch a quick risk summary for a token mint."""
-        url = f"{self.base_url}/v1/tokens/{mint}/report/summary"
+        url = f"{self.base_url}/v1/tokens/{mint}/report"
         if self.debug:
             print(f"[DEBUG] RugCheck summary request: {url}")
 
@@ -64,6 +64,8 @@ class RugCheckClient:
             "lp_locked_pct": data.get("lpLockedPct", 0),
             "token_type": data.get("tokenType", ""),
             "token_program": data.get("tokenProgram", ""),
+            "totalHolders": data.get("totalHolders", 0),
+            "locks": data.get("locks", []),
         }
 
     def _verdict_from_score(self, score_normalised: int) -> str:
