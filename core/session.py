@@ -136,6 +136,7 @@ async def run_scan(
             "address": address, "chain": "solana",
             "token_name": raw_data.get("metadata", {}).get("name", ""),
             "token_symbol": raw_data.get("metadata", {}).get("symbol", ""),
+            "deployer_address": raw_data.get("deployer_address"),
         }
         return contract, ai_result
 

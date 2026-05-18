@@ -79,7 +79,7 @@ async def _fetch_pairs_only(tokens: list) -> list:
 async def get_new_tokens(
     config: dict, limit: int = MAX_TOKENS, force_refresh: bool = False, debug: bool = False,
 ) -> List[Dict[str, Any]]:
-    from utils.cache_redis import get_cached as redis_get, set_cached as redis_set
+    from utils.cache import get_cached as redis_get, set_cached as redis_set
     cache_key = "aegis:newtokens"
 
     if not force_refresh:

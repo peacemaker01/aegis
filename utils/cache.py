@@ -4,7 +4,7 @@ Redis‑backed cache with automatic in‑memory fallback.
 """
 import json
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 # ------------------------------------------------------------
 # Try to import Redis; if not available, we'll use a local dict
@@ -53,23 +53,27 @@ async def _redis():
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def get_cached(address: str, chain: str, ttl: Optional[int] = None) -> Optional[dict]:
+async def get_cached(address: str, chain: Optional[str] = None, ttl: Optional[int] = None) -> Optional[Any]:
     """Fetch a cached value. Uses Redis if available, else in‑memory dict."""
-    key = f"cache:{chain}:{address.lower()}"
+    if chain is None:
+        key = address
+    else:
+        key = f"cache:{chain}:{address.lower()}"
 
     try:
         r = await _redis()
         pipe = r.pipeline()
         pipe.get(key)
-        if ttl:
+        if ttl and chain is not None:
             pipe.ttl(key)
         results = await pipe.execute()
         value_str = results[0]
         if value_str is None:
             return None
-        remaining = results[1] if ttl else None
-        if ttl and remaining is not None and remaining < ttl:
-            return None
+        if ttl and chain is not None:
+            remaining = results[1]
+            if remaining is not None and remaining < ttl:
+                return None
         return json.loads(value_str)
     except Exception:
         # Fallback to in‑memory cache
@@ -83,13 +87,20 @@ async def get_cached(address: str, chain: str, ttl: Optional[int] = None) -> Opt
         return None
 
 
-async def set_cached(address: str, chain: str, data: dict, ttl: int = 3600) -> None:
+async def set_cached(address: str, chain: Any, data: Optional[Any] = None, ttl: int = 3600) -> None:
     """Store *data* for *ttl* seconds. Uses Redis if available, else in‑memory dict."""
-    key = f"cache:{chain}:{address.lower()}"
+    if data is None:
+        key = address
+        val = chain
+        expiry_ttl = ttl
+    else:
+        key = f"cache:{chain}:{address.lower()}"
+        val = data
+        expiry_ttl = ttl
 
     try:
         r = await _redis()
-        await r.setex(key, ttl, json.dumps(data))
+        await r.setex(key, expiry_ttl, json.dumps(val))
     except Exception:
         # Fallback to in‑memory cache
-        _memory_cache[key] = (time.time() + ttl, data)
+        _memory_cache[key] = (time.time() + expiry_ttl, val)

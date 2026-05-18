@@ -176,7 +176,7 @@ def format_degen_report(chain: str, address: str, result: dict) -> str:
     rec = result.get('recommendation', 'CAUTION')
     
     degen_lines = []
-    degen_lines.append(f"🎰 <b>{chain.upper()} RISK: {score}/10 \"{rec}\"</b>")
+    degen_lines.append(f"🎰 <b>{chain.upper()} RISK: {score}/10.0 \"{rec}\"</b>")
 
     raw = result.get('_raw', {})
     
@@ -402,7 +402,7 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
     # Use totalHolders from the report for the real count; fall back to len() only if missing.
     holder_count = int(rugcheck.get('totalHolders', 0)) or len(holders)
     if holders:
-        top10_pct = sum(h.get('percentage', 0) for h in holders[:10])
+        top10_pct = min(100.0, sum(h.get('percentage', 0) for h in holders[:10]))
 
     # ── LP lock from RugCheck ─────────────────────────────────────────
     lp_locked = False
@@ -520,6 +520,18 @@ async def calculate_degen_risk_solana(raw: dict, ca: str, fast_mode: bool) -> di
         if score < 4.0:
             score = 4.0
             flags.append('Structural floor: Unlocked LP + concentrated holders')
+
+    # Rule 3: Extreme supply concentration (Top 10 > 80%) → minimum 7.0 (HIGH RISK)
+    if top10_pct is not None and top10_pct > 80:
+        if score < 7.0:
+            score = 7.0
+            flags.append('Floor: Extreme supply concentration — minimum HIGH RISK')
+
+    # Rule 4: High supply concentration (Top 10 > 50%) → minimum 5.0 (ELEVATED RISK)
+    elif top10_pct is not None and top10_pct > 50:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: High supply concentration — minimum ELEVATED RISK')
 
     # ---- Final clamping ----
     score = max(0.0, min(10.0, score))
@@ -641,11 +653,33 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
     # ── GoPlus signals ─────────────────────────────────────────────────
     honeypot = goplus.get('gp_is_honeypot', False)
     mintable = goplus.get('gp_is_mintable', False) if goplus.get('gp_is_mintable') is not None else None
+    transfer_pausable = goplus.get('gp_transfer_pausable', False) if goplus.get('gp_transfer_pausable') is not None else None
     owner_pct = float(goplus.get('gp_owner_percent')) if goplus.get('gp_owner_percent') is not None else None
     lp_locked = not goplus.get('gp_cannot_sell_all', False)
+    
+    # Extract total holders count
+    holder_count = 0
+    if goplus.get('gp_holder_count'):
+        try:
+            holder_count = int(goplus.get('gp_holder_count', 0))
+        except ValueError:
+            pass
+
+    # Extract top 10 holders percentage
+    top10_pct = None
+    gp_holders = goplus.get('holders', [])
+    if gp_holders:
+        try:
+            top10_pct = min(100.0, sum(float(h.get('percent', 0) or 0) * 100 for h in gp_holders[:10]))
+        except Exception:
+            pass
+
     if not goplus.get('goplus_available'):
         owner_pct = None
         lp_locked = None
+        transfer_pausable = None
+        top10_pct = None
+        holder_count = 0
 
     # ── Additive scoring ───────────────────────────────────────────────
     score = 0.0
@@ -658,13 +692,16 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
                               'Honeypot contract. You cannot sell.', '',
                               ['GoPlus: is_honeypot = true'], dex_token_name, dex_token_symbol)
 
-    # Liquidity
+    # ---- Liquidity ----
     if liq == 0:
         score += 10.0
         flags.append('Zero liquidity – cannot sell')
     elif liq < 10_000:
         score += 3.0
         flags.append(f'Very thin liquidity (${liq:,.0f})')
+    elif liq < 100_000:
+        score += 1.0
+        flags.append(f'Low liquidity (${liq:,.0f})')
     elif liq > 1_000_000:
         score -= 1.0
         flags.append(f'Deep liquidity (${liq:,.0f})')
@@ -674,9 +711,9 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         if age_hours < 1:
             score += 2.0
             flags.append('Brand new (<1 hour)')
-        elif age_hours < 24:
+        elif age_hours <= 24:
             score += 1.5
-            flags.append(f'Very new ({int(age_hours)}h)')
+            flags.append(f"Very new ({int(age_hours)}h)")
         elif age_hours < 720:
             score += 0.5
             flags.append(f'Less than 30 days old')
@@ -684,31 +721,58 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
             score -= 1.0
             flags.append('Long track record (180+ days)')
 
-    # Owner concentration (only if GoPlus returned data)
-    if owner_pct is not None:
-        if owner_pct > 80:
+    # ---- Holder concentration (only if data available) ----
+    if top10_pct is not None:
+        if top10_pct > 80:
             score += 4.0
-            flags.append(f'CRITICAL concentration: Owner holds {owner_pct:.0f}%')
-        elif owner_pct > 40:
-            score += 2.0
-            flags.append(f'Owner holds {owner_pct:.0f}%')
-        elif owner_pct > 20:
+            flags.append(f'CRITICAL concentration: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 70:
+            score += 3.0
+            flags.append(f'Highly concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 50:
             score += 1.0
-            flags.append(f'Owner holds {owner_pct:.0f}%')
-        else:
+            flags.append(f'Concentrated: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct > 30:
+            score += 0.5
+            flags.append(f'Elevated concentration: Top10 hold {top10_pct:.0f}%')
+        elif top10_pct < 30:
             score -= 1.0
-            flags.append(f'Owner holds only {owner_pct:.0f}%')
+            flags.append(f'Widely distributed: Top10 hold {top10_pct:.0f}%')
 
-    # LP lock
+    # Extra non-overlapping flags for owner percentage if notable
+    if owner_pct is not None and owner_pct > 20:
+        flags.append(f'Owner holds {owner_pct:.0f}%')
+    elif owner_pct is not None and owner_pct <= 20:
+        flags.append(f'Owner holds only {owner_pct:.0f}%')
+
+    # ---- Holder count (absolute) ----
+    if 0 < holder_count < 20:
+        score += 2.0
+        flags.append(f'Critically low holder count: only {holder_count} holders')
+    elif 0 < holder_count < 50:
+        score += 1.5
+        flags.append(f'Low holder count: {holder_count} holders')
+
+    # ---- LP lock ----
     if lp_locked is not None:
         if not lp_locked:
-            score += 2.0
+            score += 3.0
             flags.append('LP unlocked – liquidity can be removed')
 
-    # Mintable
+    # ---- Authorities & Technical Checks ----
     if mintable is True:
         score += 2.0
         flags.append('Mint function exists – supply can be inflated')
+    elif mintable is False:
+        score -= 0.25
+        flags.append('Mint authority revoked')
+
+    if transfer_pausable is True:
+        score += 2.0
+        flags.append('Transfer can be paused – tokens can be frozen')
+    elif transfer_pausable is False:
+        score -= 0.25
+        flags.append('Freeze authority revoked')
 
     # ---- Slither ----
     actual_slither = [f for f in slither_findings if isinstance(f, dict) and not f.get('_slither_metadata')]
@@ -729,19 +793,57 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         score += 2.0
         flags.append(f'Bytecode similarity to rugs: {clone_score:.0%}')
 
-    # ---- Floor Rule ----
-    if not lp_locked and owner_pct is not None and owner_pct > 40:
+    # Proxy detection penalty
+    if goplus.get('gp_is_proxy') is True:
+        score += 2.0
+        flags.append('Proxy contract detected — upgradeability risk')
+
+    # ---- Floor Rules ----
+    # Rule 1: New token (≤48h) with unlocked LP cannot score below 5.0
+    if age_hours is not None and age_hours != 999 and age_hours <= 48 and lp_locked is False:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: New token with unlocked LP — minimum HIGH RISK')
+
+    # Rule 2: LP unlocked + top10 >50% → minimum 4.0
+    if lp_locked is False and top10_pct is not None and top10_pct > 50:
         if score < 4.0:
             score = 4.0
             flags.append('Structural floor: Unlocked LP + concentrated holders')
+
+    # Rule 3: Extreme supply concentration (Top 10 > 80%) → minimum 7.0 (HIGH RISK)
+    if top10_pct is not None and top10_pct > 80:
+        if score < 7.0:
+            score = 7.0
+            flags.append('Floor: Extreme supply concentration — minimum HIGH RISK')
+
+    # Rule 4: High supply concentration (Top 10 > 50%) → minimum 5.0 (ELEVATED RISK)
+    elif top10_pct is not None and top10_pct > 50:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: High supply concentration — minimum ELEVATED RISK')
+
+    # Rule 5: Mintable function exists → minimum 5.0 (ELEVATED RISK)
+    if mintable is True:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: Mintable token — minimum ELEVATED RISK')
+
+    # Rule 6: High severity code vulnerability → minimum 5.0
+    if high_count >= 1:
+        if score < 5.0:
+            score = 5.0
+            flags.append('Floor: High-severity code vulnerability detected')
 
     # Final clamping
     score = max(0.0, min(10.0, score))
 
     # ---- Structural risk count ----
     _structural_risks = sum([
-        not lp_locked,
-        (owner_pct or 0) > 40,
+        lp_locked is False,
+        (top10_pct or 0) > 50,
+        (age_hours or 999) <= 48,
+        (0 < holder_count < 50),
     ])
 
     # Label
@@ -763,10 +865,18 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         label = 'LOW RISK – VERIFIED BY ON‑CHAIN DATA'
 
     # Summaries
-    code_summary = f"Mintable: {mintable} | Owner: {owner_pct}%" if owner_pct is not None else "Tokenomics data unavailable"
-    bag_alert = f'Owner: {owner_pct:.0f}%' if owner_pct is not None else 'Owner data unavailable'
+    code_parts = ['Proxy/Clone' if goplus.get('gp_is_proxy') else 'Standard Token']
+    code_parts.append('Mint: Revoked' if mintable is False else 'Mint: LIVE' if mintable is True else 'Mint: Unknown')
+    code_parts.append('Freeze: Revoked' if transfer_pausable is False else 'Freeze: LIVE' if transfer_pausable is True else 'Freeze: Unknown')
+    code_summary = ' | '.join(code_parts)
+
+    if top10_pct is not None:
+        bag_alert = f'Top10: {top10_pct:.0f}% | Holders: {holder_count}'
+    else:
+        bag_alert = f'Owner: {owner_pct:.0f}% | Holders: {holder_count}' if owner_pct is not None else 'Holder data unavailable'
     if liq:
         bag_alert += f' | LIQ: ${liq:,.0f}'
+
     lp_status_str = 'Locked' if lp_locked else 'Unlocked' if lp_locked is not None else 'Unknown'
     # age_hours == 999 is the sentinel for unknown – never show it as a real age
     if age_hours is not None and age_hours != 999:
@@ -775,9 +885,9 @@ async def calculate_degen_risk_evm(raw: dict, ca: str, fast_mode: bool) -> dict:
         age_str = '?'
 
     risk_flags = [f for f in flags if not f.startswith(('Deep liquidity', 'Long track record', 'Widely distributed', 'LP locked for', 'Mint authority revoked', 'Freeze authority revoked', 'Owner holds only'))]
-    _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:')
+    _priority_prefixes = ('Critically low', 'Zero liquidity', 'Very thin', 'Brand new', 'Very new', 'Mint authority live', 'Freeze authority live', 'CRITICAL concentration', 'Highly concentrated', 'LP unlocked', 'Floor:', 'Mint function exists', 'Slither found', 'Bytecode similarity')
     priority_flags = [f for f in risk_flags if any(f.startswith(p) for p in _priority_prefixes)]
-    main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else (flags[0] if flags else 'Insufficient data'))
+    main_risk = priority_flags[0] if priority_flags else (risk_flags[0] if risk_flags else 'No significant on-chain risks identified')
 
     return make_risk_dict(round(score, 1), label, code_summary, bag_alert,
                           age_str, f'${liq:,.0f}' if liq else '$0', lp_status_str,
@@ -868,6 +978,60 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     else:
         risk = await calculate_degen_risk_evm(raw, address, fast_mode)
 
+    # ── Synchronise result dictionary with deterministic metrics for PDF consistency ──
+    result['risk_score'] = risk['score']
+    result['recommendation'] = risk['label']
+    
+    # Generate executive summary for PDF
+    summary_lines = [
+        f"Aegis Automated Security Assessment for {display_name if 'display_name' in locals() else address[:10]}.",
+        "",
+        f"🎰 RISK ASSESSMENT: {risk['score']:.1f}/10.0 (VERDICT: {risk['label']})",
+        f"🚨 MAIN RISK: {risk['main_risk']}"
+    ]
+    if risk.get('flags'):
+        summary_lines.append("")
+        summary_lines.append("SECURITY FLAGS & FINDINGS:")
+        for f in risk['flags']:
+            summary_lines.append(f"- {f}")
+    result['summary'] = "\n".join(summary_lines)
+
+    # Set exact security flag overrides for PDF
+    if chain == "solana":
+        mint_info = raw.get('mint_info', {}) or {}
+        mint_revoked = mint_info.get('mint_authority') is None
+        freeze_revoked = mint_info.get('freeze_authority') is None
+        
+        result['honeypot'] = 'Zero liquidity' in risk['main_risk'] or 'Honeypot' in risk['main_risk']
+        result['mint_function'] = not mint_revoked
+        result['owner_renounced'] = mint_revoked
+        result['hidden_owner'] = False
+        result['blacklist_function'] = not freeze_revoked
+        result['transfer_tax_modifiable'] = False
+        result['proxy_pattern'] = False
+        result['liquidity_concerns'] = (raw.get('dex', {}).get('liquidity', 0) or 0) < 50000
+    else:
+        goplus = raw.get('goplus', {}) or {}
+        owner_addr = goplus.get('gp_owner_address', '')
+        is_renounced = owner_addr in ('', '0x0000000000000000000000000000000000000000', '0x000000000000000000000000000000000000dead')
+        
+        result['honeypot'] = goplus.get('gp_is_honeypot', False)
+        result['mint_function'] = goplus.get('gp_is_mintable', False)
+        result['owner_renounced'] = is_renounced
+        result['hidden_owner'] = goplus.get('gp_hidden_owner', False)
+        result['blacklist_function'] = goplus.get('gp_is_blacklisted', False) or goplus.get('gp_transfer_pausable', False)
+        result['transfer_tax_modifiable'] = goplus.get('gp_slippage_modifiable', False)
+        result['proxy_pattern'] = goplus.get('gp_is_proxy', False)
+        
+        # Parse liquidity from risk['liq_str']
+        liq_val = 0.0
+        if risk.get('liq_str') and '$' in risk['liq_str']:
+            try:
+                liq_val = float(risk['liq_str'].replace('$','').replace(',',''))
+            except Exception:
+                pass
+        result['liquidity_concerns'] = liq_val > 0 and liq_val < 50000
+
     # ── Build DEGEN output ─────────────────────────────────────────────
     # Token name from contract data (fallback to address)
     evm_token_name = contract.get('token_name') or risk.get('dex_name') or address[:12] + '…'
@@ -877,16 +1041,27 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
 
     age_str = risk.get('age_str', '?')
 
+    deployer = None
+    if chain == "solana":
+        deployer = contract.get("deployer_address")
+    else:
+        deployer = contract.get("creator") or result.get("_raw", {}).get("goplus", {}).get("gp_creator_address")
+
     lines = [
         f"<b>{token_name} ({token_symbol})</b>",
         f"<code>{escape_html(address)}</code>",
+    ]
+    if deployer:
+        lines.append(f"🕵️ <b>DEPLOYER:</b> <code>{escape_html(deployer)}</code>")
+    
+    lines.extend([
         "",
-        f"🎰 <b>{chain.upper()} RISK: {risk['score']:.1f}/10 \"{risk['label']}\"</b>",
+        f"🎰 <b>{chain.upper()} RISK: {risk['score']:.1f}/10.0 \"{risk['label']}\"</b>",
         f"💰 <b>BAG ALERT:</b> {risk['bag_alert']}",
         f"🔍 <b>CODE:</b> {risk['code_summary']}",
         f"⏱️ <b>AGE:</b> {age_str} | <b>LIQ:</b> {risk['liq_str']} | <b>LP:</b> {risk['lp_status']}",
         f"🚨 <b>MAIN RISK:</b> {risk['main_risk']}",
-    ]
+    ])
 
     # Append deep‑specific flags if present
     if risk.get('flags'):
@@ -903,6 +1078,9 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     sanitize_output(reply)
 
     keyboard = [[InlineKeyboardButton("📄 Download PDF Report", callback_data=f"pdf_{address}")]]
+    if deployer:
+        keyboard.append([InlineKeyboardButton("🕵️ Analyze Deployer Wallet", callback_data=f"deployer_check_{deployer}")])
+        
     await msg.edit_text(reply, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
     context.user_data.update({
@@ -921,18 +1099,54 @@ async def deployer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private_chat(update): return
     if not await require_subscription(update, context): return
     args = context.args
-    if not args: await update.message.reply_text("Usage: /deployer <address>"); return
+    if not args: await update.effective_message.reply_text("Usage: /deployer <address>"); return
     address = args[0]; user_id = update.effective_user.id; await usage_logger(user_id, "deployer", address)
-    msg = await update.message.reply_text(f"🔍 Analyzing deployer <code>{escape_html(address)}</code> across 5 chains...", parse_mode="HTML")
+    force_refresh = any(arg.lower() in ["force", "refresh", "--force"] for arg in args[1:])
+    from utils.validators import is_solana_address
+    is_sol = is_solana_address(address)
+    loading_text = f"🔍 Analyzing deployer <code>{escape_html(address)}</code> on Solana..." if is_sol else f"🔍 Analyzing deployer <code>{escape_html(address)}</code> across 5 chains..."
+    msg = await update.effective_message.reply_text(loading_text, parse_mode="HTML")
     try:
-        profile, result = await run_deployer_analysis(address, config, chains=["eth","bsc","polygon","base","arb"], stream=False, debug=DEBUG)
+        profile, result = await run_deployer_analysis(address, config, chains=["eth","bsc","polygon","base","arb"], stream=False, debug=DEBUG, force_refresh=force_refresh)
         score = result.get('reputation_score', result.get('risk_score','N/A')); verdict = result.get('verdict','N/A'); rec = result.get('recommendation','N/A')
         summary = result.get('summary','No summary.'); total = profile.get('total_deployments',0)
+        
         reply = (
             f"<b>🕵️ Deployer Forensics</b>\nWallet: <code>{escape_html(address)}</code>\nContracts deployed: {total}\n\n"
             f"Reputation Score: <b>{score}/100</b>\nVerdict: <b>{escape_html(verdict)}</b>\nRecommendation: <b>{escape_html(rec)}</b>\n\n"
             f"📝 <b>Summary:</b>\n{escape_html(summary)}"
         )
+        
+        # Enrich with Nansen data if available
+        nansen = profile.get("nansen") or {}
+        nansen_label = nansen.get("label") or {}
+        nansen_rep = nansen.get("reputation") or {}
+        
+        nansen_summary = ""
+        if nansen_label or nansen_rep:
+            is_goplus = nansen_label.get("entity") == "goplus_fallback"
+            if is_goplus:
+                nansen_summary = "\n\n🛡️ <b>GoPlus Security Insights (Free Alternative)</b>"
+            else:
+                nansen_summary = "\n\n🏛️ <b>Nansen Institutional Insights</b>"
+
+            if nansen_label.get("label"):
+                label_ent = "security_audit" if is_goplus else nansen_label.get('entity', 'unknown')
+                nansen_summary += f"\n• Label: <code>{escape_html(nansen_label['label'])}</code> ({escape_html(label_ent)})"
+                if nansen_label.get("is_smart_money"):
+                    nansen_summary += " [🏷️ <b>Smart Money</b>]"
+            if nansen_rep:
+                nansen_score = nansen_rep.get("reputation_score", 5.0)
+                trust_label = "GoPlus Trust" if is_goplus else "Nansen Trust"
+                nansen_summary += f"\n• {trust_label}: <b>{nansen_score:.1f}/10.0</b>"
+                if nansen_rep.get("is_known_scammer"):
+                    nansen_summary += f"\n• 🚨 <b>KNOWN SCAMMER (Confidence: {nansen_rep.get('scam_confidence', 0.0):.0%})</b>"
+                if nansen_rep.get("failed_contracts", 0) > 0:
+                    nansen_summary += f"\n• Failed Contracts: <b>{nansen_rep.get('failed_contracts')}</b>"
+        
+        if nansen_summary:
+            reply += nansen_summary
+            
         red_flags = result.get('red_flags',[])[:3]
         if red_flags: reply += "\n\n🚩 <b>Red Flags:</b>\n" + "\n".join(f"• {escape_html(f)}" for f in red_flags)
         await msg.edit_text(reply, parse_mode="HTML")
@@ -1203,7 +1417,7 @@ async def _degenflow_new_launches(update: Update, context: ContextTypes.DEFAULT_
 
                 lines.extend([
                     f"{name} ({symbol}) {addr}",
-                    f"🎰 <b>RISK: {token['risk_score']:.1f}/10 \"{token['risk_label']}\"</b>",
+                    f"🎰 <b>RISK: {token['risk_score']:.1f}/10.0 \"{token['risk_label']}\"</b>",
                     f"🔍 <b>CODE:</b> {token['code_summary']}",
                     f"💰 <b>BAG ALERT:</b> {token['bag_alert']}",
                     f"⏱️ <b>AGE:</b> {age_str} | <b>LIQ:</b> {liq_str} | <b>LP:</b> {token['lp_status']}",
@@ -1671,17 +1885,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contract, result = await run_scan(address, "solana", config, fast_mode=True)
             raw = result.get("_raw", {})
             risk = await calculate_degen_risk_solana(raw, address, fast_mode=True)
+            deployer = contract.get("deployer_address")
 
             lines = [
                 f"<b>{display_name} ({display_symbol})</b>",
                 f"<code>{escape_html(address)}</code>",
+            ]
+            if deployer:
+                lines.append(f"🕵️ <b>DEPLOYER:</b> <code>{escape_html(deployer)}</code>")
+                
+            lines.extend([
                 "",
-                f"🎰 <b>AEGIS SCORE: {risk['score']:.1f}/10 \"{risk['label']}\"</b>",
+                f"🎰 <b>AEGIS SCORE: {risk['score']:.1f}/10.0 \"{risk['label']}\"</b>",
                 f"💰 <b>BAG ALERT:</b> {risk['bag_alert']}",
                 f"🔍 <b>CODE:</b> {risk['code_summary']}",
                 f"⏱️ <b>AGE:</b> {risk['age_str']} | <b>LIQ:</b> {risk['liq_str']} | <b>LP:</b> {risk['lp_status']}",
                 f"🚨 <b>MAIN RISK:</b> {risk['main_risk']}",
-            ]
+            ])
             if risk.get("flags"):
                 lines.append("")
                 lines.append("<b>DETAILED FLAGS:</b>")
@@ -1695,9 +1915,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             reply = "\n".join(lines)
             sanitize_output(reply)
-            await msg.edit_text(reply, parse_mode="HTML")
+            
+            keyboard = []
+            if deployer:
+                keyboard.append([InlineKeyboardButton("🕵️ Analyze Deployer Wallet", callback_data=f"deployer_check_{deployer}")])
+                
+            await msg.edit_text(reply, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None, parse_mode="HTML")
         except Exception as e:
             await msg.edit_text(f"❌ Audit failed: {escape_html(str(e))}")
+    elif data.startswith("deployer_check_"):
+        address = data.replace("deployer_check_", "")
+        await query.answer(f"Auditing deployer {address[:8]}...")
+        context.args = [address]
+        await deployer_command(update, context)
     elif data.startswith("pdf_"):
         address = data[4:]
         result = context.user_data.get('last_scan_result', {})
@@ -1790,6 +2020,31 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.commit()
     await update.message.reply_text(f"✅ Revoked subscription for {target_id}.")
 
+async def clear_cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear both in-memory and Redis caches."""
+    try:
+        # Clear local memory cache
+        from utils.cache import _memory_cache
+        _memory_cache.clear()
+
+        # Clear Redis cache
+        try:
+            import redis.asyncio as aioredis
+            from utils.cache import REDIS_URL
+            if REDIS_URL:
+                r = aioredis.from_url(REDIS_URL)
+                await r.flushall()
+                if hasattr(r, "aclose"):
+                    await r.aclose()
+                else:
+                    await r.close()
+        except Exception:
+            pass
+
+        await update.message.reply_text("🧹 Cache cleared successfully!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error clearing cache: {e}")
+
 # ─────────────────────────── Error handler ───────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -1835,6 +2090,8 @@ async def main_async():
         ("terms", terms_command),
         ("grant", grant_command),
         ("revoke", revoke_command),
+        ("clear_cache", clear_cache_command),
+        ("flush", clear_cache_command),
     ]:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(CallbackQueryHandler(button_callback))

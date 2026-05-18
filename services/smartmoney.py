@@ -2,7 +2,7 @@
 import asyncio, time, logging
 from typing import List, Dict, Any
 import httpx
-from utils.cache_redis import get_cached, set_cached
+from utils.cache import get_cached, set_cached
 
 logger = logging.getLogger(__name__)
 

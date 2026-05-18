@@ -15,8 +15,47 @@ def _get_cache_key(mint: str, source_hash: str) -> str:
     return f"solana_scan_{mint}_{source_hash}"
 
 
-async def _get_deployer_address(raw_data: Dict[str, Any]) -> Optional[str]:
-    # Try to get deployer from RugCheck as fallback if available, or stay None
+async def _get_deployer_address(mint: str, rpc_client: SolanaRPCClient) -> Optional[str]:
+    import httpx
+    # 1. Try Pump.fun API if it is a pump token
+    if mint.endswith("pump"):
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"https://frontend-api.pump.fun/coins/{mint}")
+                if r.status_code == 200:
+                    data = r.json()
+                    creator = data.get("creator")
+                    if creator:
+                        return creator
+        except Exception:
+            pass
+
+    # 2. Try Helius DAS API getAsset
+    try:
+        result = await rpc_client._make_rpc_request("getAsset", [mint])
+        if result:
+            ignored_addrs = {
+                "11111111111111111111111111111111", # System Program
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", # SPL Token
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", # Token-2022
+                "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s", # Token Metadata
+                "TSLvdd1pZvENhtJ2tYgEPcrK34EG15B9vDYCg28MLJd", # Pump.fun update authority
+            }
+            
+            creators = result.get("creators") or []
+            for c in creators:
+                addr = c.get("address")
+                if addr and addr not in ignored_addrs:
+                    return addr
+                    
+            authorities = result.get("authorities") or []
+            for a in authorities:
+                addr = a.get("address")
+                if addr and addr not in ignored_addrs:
+                    return addr
+    except Exception:
+        pass
+
     return None
 
 
@@ -144,7 +183,7 @@ async def run_solana_scan(
     if progress_callback:
         await progress_callback("🕵️ Checking cross-chain deployer history...")
 
-    deployer_address = await _get_deployer_address(raw_data)
+    deployer_address = await _get_deployer_address(mint, rpc_client)
     cross_chain_profile = None
     if deployer_address:
         if debug:

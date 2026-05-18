@@ -27,9 +27,29 @@ NANSEN_CHAINS = {
 
 
 class NansenClient:
-    def __init__(self, api_key: str, timeout: int = 15):
-        self.api_key = api_key
+    def __init__(self, api_key: str | List[str], timeout: int = 15):
+        if isinstance(api_key, list):
+            self.api_keys = api_key
+        elif isinstance(api_key, str) and "," in api_key:
+            self.api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
+        else:
+            self.api_keys = [api_key] if api_key else []
+        
+        self.current_index = 0
         self.timeout = timeout
+
+    @property
+    def api_key(self) -> str:
+        if not self.api_keys:
+            return ""
+        return self.api_keys[self.current_index]
+
+    def rotate_key(self, debug: bool = False):
+        if len(self.api_keys) > 1:
+            old_key = self.api_key
+            self.current_index = (self.current_index + 1) % len(self.api_keys)
+            if debug:
+                print(f"[DEBUG] Rotating Nansen API key from {old_key[:8]}... to {self.api_key[:8]}...")
 
     def _headers(self) -> dict:
         return {
@@ -37,9 +57,10 @@ class NansenClient:
             "Content-Type": "application/json",
         }
 
-    async def get_wallet_label(self, address: str, chain: str) -> Optional[Dict[str, Any]]:
+    async def get_wallet_label(self, address: str, chain: str, debug: bool = False) -> Optional[Dict[str, Any]]:
         """
         Fetch wallet label and metadata from Nansen.
+        Hits the POST /api/v1/profiler/address/labels endpoint.
         Returns: {
             "label": str,           # e.g., "Binance: Hot Wallet", "Uniswap: Router", etc.
             "entity": str,          # Entity type: "exchange", "fund", "market_maker", "developer", "investor", "unknown"
@@ -48,27 +69,102 @@ class NansenClient:
             "is_smart_money": bool, # Whether labeled as smart money
         }
         """
-        if not self.api_key or not is_valid_address(address):
+        if not is_valid_address(address):
             return None
 
         chain_name = NANSEN_CHAINS.get(chain.lower())
         if not chain_name:
-            return None
+            chain_name = "ethereum"
 
-        await nansen_limiter.acquire()
+        nansen_success = False
+        if self.api_keys:
+            for attempt in range(max(1, len(self.api_keys))):
+                await nansen_limiter.acquire()
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        url = f"{NANSEN_BASE}/profiler/address/labels"
+                        payload = {"address": address.lower(), "chain": chain_name}
+                        r = await client.post(url, json=payload, headers=self._headers())
+
+                        if r.status_code == 200:
+                            data = r.json()
+                            return self._parse_labels_post_response(data)
+                        elif r.status_code in [401, 403, 429]:
+                            if debug:
+                                print(f"[DEBUG] Nansen labels API error (attempt {attempt+1}/{len(self.api_keys)}): status={r.status_code}, key={self.api_key[:8]}... - Rotating key")
+                            self.rotate_key(debug=debug)
+                            continue
+                        else:
+                            if debug:
+                                print(f"[DEBUG] Nansen labels API error: status={r.status_code}, body={r.text}, key={self.api_key[:8]}...")
+                            break
+                except Exception as e:
+                    if debug:
+                        print(f"[DEBUG] Nansen labels exception (attempt {attempt+1}): {e}")
+                    self.rotate_key(debug=debug)
+
+        # Fallback to GoPlus Address Security (100% Free, No API Key Required)
+        if debug:
+            print(f"[DEBUG] Nansen lookup failed or keys exhausted. Querying GoPlus Address Security for {address}...")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                url = f"{NANSEN_BASE}/wallet/{address}/labels"
-                params = {"chain": chain_name}
-                r = await client.get(url, params=params, headers=self._headers())
-
+            chain_ids = {
+                "eth": "1",
+                "bsc": "56",
+                "polygon": "137",
+                "base": "8453",
+                "arb": "42161",
+            }
+            chain_id = chain_ids.get(chain.lower(), "1")
+            url = f"https://api.gopluslabs.io/api/v1/address_security/{address.lower()}?chain_id={chain_id}"
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url)
                 if r.status_code == 200:
                     data = r.json()
-                    if data.get("data"):
-                        return self._parse_label_response(data["data"])
-        except Exception:
-            pass
+                    if data.get("code") == 1 and data.get("result"):
+                        res = data["result"]
+                        
+                        has_risks = any(
+                            res.get(k) == "1" for k in [
+                                "honeypot_related_address", "phishing_activities", 
+                                "blackmail_activities", "mixer", "stealing_attack", 
+                                "money_laundering", "sanctioned", "cybercrime", 
+                                "darkweb_transactions", "blacklist_doubt"
+                            ]
+                        )
+                        
+                        malicious_contracts = int(res.get("number_of_malicious_contracts_created", "0") or 0)
+                        
+                        label_name = "Clean EOA"
+                        if malicious_contracts > 0:
+                            label_name = f"Malicious Deployer ({malicious_contracts} scams)"
+                        elif has_risks:
+                            label_name = "High Risk EOA (GoPlus)"
+                        
+                        reputation_score = 10.0
+                        if malicious_contracts > 0 or has_risks:
+                            reputation_score = 1.0
+                            
+                        return {
+                            "label": label_name,
+                            "entity": "goplus_fallback",
+                            "risk_score": 10.0 - reputation_score,
+                            "category": "security_audit",
+                            "is_smart_money": False,
+                            "goplus_data": {
+                                "reputation_score": reputation_score,
+                                "is_known_scammer": malicious_contracts > 0 or has_risks,
+                                "scam_confidence": 0.9 if malicious_contracts > 0 else (0.7 if has_risks else 0.0),
+                                "failed_contracts": malicious_contracts,
+                                "is_mixer_user": res.get("mixer") == "1",
+                                "total_contracts_deployed": 0,
+                                "platforms_used": [],
+                            }
+                        }
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] GoPlus Address Security fallback failed: {e}")
 
         return None
 
@@ -292,40 +388,55 @@ class NansenClient:
 
         return None
 
-    async def get_deployer_reputation(self, deployer_address: str) -> Optional[Dict[str, Any]]:
+    async def get_deployer_reputation(self, deployer_address: str, debug: bool = False) -> Optional[Dict[str, Any]]:
         """
-        Fetch deployer historical reputation and track record.
-        Returns: {
-            "total_contracts_deployed": int,
-            "success_rate": float,              # 0-1
-            "failed_contracts": int,            # Rugs, honeypots, etc.
-            "total_deployed_value": float,      # USD value deployed
-            "is_known_scammer": bool,
-            "scam_confidence": float,           # 0-1
-            "platforms_used": [str],            # e.g., ["Uniswap", "Pancakeswap"]
-            "chains_used": [str],
-            "last_activity": str,               # ISO timestamp
-            "reputation_score": float,          # 0-10
-        }
+        Fetch deployer reputation indicators based on Nansen profiler labels.
         """
         if not self.api_key or not is_valid_address(deployer_address):
             return None
 
-        await nansen_limiter.acquire()
+        # Fetch labels using ethereum as default or across all chains if needed
+        labels_data = await self.get_wallet_label(deployer_address, "eth", debug=debug)
+        if not labels_data:
+            return None
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                url = f"{NANSEN_BASE}/address/{deployer_address}/reputation"
-                r = await client.get(url, headers=self._headers())
+        # Calculate reputational parameters
+        entity = labels_data.get("entity", "unknown")
+        is_smart = labels_data.get("is_smart_money", False)
+        lbl = labels_data.get("label", "").lower()
+        
+        # Default starting parameters
+        rep_score = 5.0
+        is_scammer = False
+        scam_confidence = 0.0
+        
+        # Scammer/malicious detection based on keywords
+        scam_keywords = ["scam", "scammer", "exploiter", "phish", "hack", "drainer", "tornado", "exposed", "malicious"]
+        if any(kw in lbl for kw in scam_keywords) or labels_data.get("category", "") in ["scam", "exploit"]:
+            is_scammer = True
+            scam_confidence = 0.95
+            rep_score = 0.0
+        elif entity in ["exchange", "fund"]:
+            rep_score = 9.5
+        elif is_smart:
+            rep_score = 8.5
+        elif labels_data.get("category") == "social":
+            rep_score = 6.0
+        elif labels_data.get("label"):
+            rep_score = 7.0
 
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("data"):
-                        return self._parse_reputation_response(data["data"])
-        except Exception:
-            pass
-
-        return None
+        return {
+            "total_contracts_deployed": 0,
+            "success_rate": 1.0 if rep_score > 7 else 0.5,
+            "failed_contracts": 0,
+            "total_deployed_value": 0.0,
+            "is_known_scammer": is_scammer,
+            "scam_confidence": scam_confidence,
+            "platforms_used": [],
+            "chains_used": [],
+            "last_activity": "",
+            "reputation_score": rep_score,
+        }
 
     # Response parsers
     def _parse_label_response(self, data: Dict) -> Dict[str, Any]:
@@ -341,6 +452,51 @@ class NansenClient:
                 "risk_score": float(data.get("risk_score", 5.0)),
                 "category": data.get("category", ""),
                 "is_smart_money": data.get("is_smart_money", False),
+                "nansen_available": True,
+            }
+        except Exception:
+            return {"nansen_available": False}
+
+    def _parse_labels_post_response(self, data: Dict) -> Dict[str, Any]:
+        """Parse Nansen POST labels endpoint response into standardized Aegis label schema."""
+        try:
+            labels = data.get("data", [])
+            primary_label = ""
+            entity_type = "unknown"
+            is_smart_money = False
+            category = ""
+
+            for item in labels:
+                lbl = item.get("label", "")
+                cat = item.get("category", "")
+                
+                lbl_lower = lbl.lower()
+                cat_lower = cat.lower()
+
+                if "smart money" in lbl_lower or "smart money" in cat_lower or "heavy trader" in lbl_lower or "token millionaire" in lbl_lower:
+                    is_smart_money = True
+
+                if any(x in lbl_lower for x in ["binance", "coinbase", "kraken", "okx", "huobi", "exchange", "hot wallet", "deposit", "cold wallet"]):
+                    entity_type = "exchange"
+                elif any(x in lbl_lower for x in ["fund", "vc", "capital", "multicoin", "wintermute", "jump", "a16z", "alameda", "institutional", "market maker", "mm"]):
+                    entity_type = "market_maker" if "market maker" in lbl_lower or "mm" in lbl_lower or "wintermute" in lbl_lower or "jump" in lbl_lower else "fund"
+                elif any(x in lbl_lower for x in ["deployer", "developer", "creator", "multisig"]):
+                    entity_type = "developer"
+
+                if not primary_label and cat != "social" and lbl:
+                    primary_label = lbl
+                    category = cat
+
+            if not primary_label and labels:
+                primary_label = labels[0].get("label", "")
+                category = labels[0].get("category", "")
+
+            return {
+                "label": primary_label,
+                "entity": entity_type,
+                "risk_score": 0.0 if entity_type in ["exchange", "fund"] else 5.0,
+                "category": category,
+                "is_smart_money": is_smart_money,
                 "nansen_available": True,
             }
         except Exception:
@@ -458,15 +614,20 @@ async def fetch_nansen_deployer_data(
 
     result = {}
 
-    # Get deployer label
-    label_data = await client.get_wallet_label(deployer_address, chain)
+    # Get deployer label (with GoPlus fallback inside)
+    label_data = await client.get_wallet_label(deployer_address, chain, debug=debug)
     if label_data:
         result["label"] = label_data
         if debug:
-            print(f"[DEBUG] Nansen deployer label: {label_data.get('label')}")
+            print(f"[DEBUG] Deployer label: {label_data.get('label')} (entity: {label_data.get('entity')})")
 
-    # Get deployer reputation
-    reputation = await client.get_deployer_reputation(deployer_address)
+        # If it was a GoPlus fallback, copy the goplus_data to reputation
+        if label_data.get("entity") == "goplus_fallback":
+            result["reputation"] = label_data.get("goplus_data", {})
+            return result
+
+    # Standard Nansen reputation fetch
+    reputation = await client.get_deployer_reputation(deployer_address, debug=debug)
     if reputation:
         result["reputation"] = reputation
         if debug:

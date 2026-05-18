@@ -131,6 +131,7 @@ def parse_goplus(raw: dict) -> dict:
         "gp_token_name": _str("token_name"),
         "gp_token_symbol": _str("token_symbol"),
         "gp_dex": raw.get("dex", []),
+        "holders": raw.get("holders", []),
     }
 
 

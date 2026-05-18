@@ -91,6 +91,10 @@ def load_config() -> dict:
             "merchant_id": os.getenv("CRYPTOMUS_MERCHANT_ID", ""),
             "payment_key": os.getenv("CRYPTOMUS_PAYMENT_KEY", ""),
         },
+        "nansen": {
+            "api_key": os.getenv("NANSEN_API_KEY", "").split(",")[0] if os.getenv("NANSEN_API_KEY") else "",
+            "api_keys": [k.strip() for k in os.getenv("NANSEN_API_KEY", "").split(",") if k.strip()],
+        },
     }
 
 

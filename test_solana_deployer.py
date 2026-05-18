@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone test for Deployer Forensics module with verbose debug output."""
+"""Standalone test for Solana Deployer Forensics module with verbose debug output."""
 import asyncio
 import os
 import sys
@@ -11,23 +11,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.config import load_config
 from core.deployer_session import run_deployer_analysis
 
-TEST_DEPLOYER = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
-TEST_CHAINS = ["eth", "bsc", "polygon", "base", "arb"]
+# A known Solana address (e.g. the configured treasury wallet or token mint)
+TEST_DEPLOYER = "Gbnyp3og4hZiF67wdTiqAE7ieiNgM4FjLWAM9UmoRRzS"
 
 async def main():
-    print(f"\n🔍 Deployer Forensics: {TEST_DEPLOYER}")
-    print(f"   Scanning chains: {', '.join(TEST_CHAINS)}\n")
+    print(f"\n🔍 Solana Deployer Forensics: {TEST_DEPLOYER}\n")
 
     config = load_config()
     try:
         profile, result = await run_deployer_analysis(
-            TEST_DEPLOYER, config, TEST_CHAINS,
+            TEST_DEPLOYER, config,
             stream=False, debug=True, force_refresh=True   # <-- bypass cache
         )
         print("\n" + "="*50)
-        print("FINAL REPORT")
+        print("FINAL SOLANA REPORT")
         print("="*50)
-        print(f"NANSEN DATA: {profile.get('nansen')}")
+        print(f"Total Deployments: {profile.get('total_deployments')}")
+        print(f"Funder: {profile.get('funder')}")
         print(f"Reputation Score: {result.get('reputation_score', 'N/A')}/100")
         print(f"Verdict: {result.get('verdict')}")
         print(f"Recommendation: {result.get('recommendation')}")

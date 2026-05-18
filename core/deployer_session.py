@@ -5,12 +5,13 @@ from typing import AsyncGenerator, List, Optional
 
 from core.chains import CHAINS
 from fetchers.deployer import DeployerFetcher
+from fetchers.nansen import NansenClient, fetch_nansen_deployer_data
 from ai.deployer_prompt import build_deployer_prompt
 from ai.client import OpenRouterClient
 from utils.validators import is_valid_address
 from utils.cache import get_cached, set_cached
 
-DEPLOYER_CACHE_KEY_PREFIX = "deployer_v2_"
+DEPLOYER_CACHE_KEY_PREFIX = "deployer_v2_nansen_"
 
 async def run_deployer_analysis(
     deployer: str,
@@ -26,14 +27,20 @@ async def run_deployer_analysis(
     if not is_valid_address(deployer):
         raise ValueError(f"Invalid wallet address: {deployer}")
 
-    api_keys = config["explorers"].get("etherscan", [])
-    if isinstance(api_keys, str):
-        api_keys = [api_keys] if api_keys else []
-    if not api_keys:
-        raise ValueError("Etherscan API key required for deployer forensics.")
+    from utils.validators import is_solana_address
+    is_sol = is_solana_address(deployer)
 
-    chains_to_scan = chains or ["eth", "bsc", "polygon", "base", "arb"]
-    cache_key = f"{DEPLOYER_CACHE_KEY_PREFIX}{deployer.lower()}_{'_'.join(sorted(chains_to_scan))}"
+    if is_sol:
+        chains_to_scan = ["solana"]
+        cache_key = f"{DEPLOYER_CACHE_KEY_PREFIX}{deployer.lower()}_solana"
+    else:
+        api_keys = config["explorers"].get("etherscan", [])
+        if isinstance(api_keys, str):
+            api_keys = [api_keys] if api_keys else []
+        if not api_keys:
+            raise ValueError("Etherscan API key required for deployer forensics.")
+        chains_to_scan = chains or ["eth", "bsc", "polygon", "base", "arb"]
+        cache_key = f"{DEPLOYER_CACHE_KEY_PREFIX}{deployer.lower()}_{'_'.join(sorted(chains_to_scan))}"
 
     if not force_refresh:
         cached = await get_cached(deployer, cache_key)
@@ -45,28 +52,61 @@ async def run_deployer_analysis(
             if not stream:
                 return profile, result
 
-    fetcher = DeployerFetcher(api_keys, debug=debug)
+    if is_sol:
+        from aegis_solana.rpc_client import SolanaRPCClient
+        from fetchers.solana_deployer import SolanaDeployerFetcher
 
-    if debug:
-        print(f"[DEBUG] Fetching deployment history across {chains_to_scan}")
-    deployments = await fetcher.get_deployment_history(deployer, chains_to_scan)
-    if debug:
-        print(f"[DEBUG] Found {len(deployments)} total deployments")
+        rpc_endpoint = config.get("rpc", {}).get("solana", "https://eu.fluxrpc.com")
+        flux_api_key = config.get("solana", {}).get("fluxrpc_api_key", "")
+        rpc_client = SolanaRPCClient(endpoint=rpc_endpoint, api_key=flux_api_key, debug=debug)
+        fetcher = SolanaDeployerFetcher(rpc_client, debug=debug)
 
-    if debug:
-        print("[DEBUG] Analyzing funder...")
-    funder_info = await fetcher.analyze_funder(deployer, deployments, api_keys[0])
-    if debug:
-        print(f"[DEBUG] Funder: {funder_info.get('funder_address')}")
+        if debug:
+            print("[DEBUG] Fetching Solana deployment history...")
+        deployments = await fetcher.get_deployment_history(deployer)
+        if debug:
+            print(f"[DEBUG] Found {len(deployments)} total Solana deployments")
 
-    if debug:
-        print("[DEBUG] Calculating risk profile...")
-    risk_profile = fetcher.calculate_risk_profile(deployments, funder_info)
-    if debug:
-        print(f"[DEBUG] Reputation score: {risk_profile.get('reputation_score')}/100")
-        print(f"[DEBUG] Risk flags: {risk_profile.get('risk_flags')}")
+        if debug:
+            print("[DEBUG] Analyzing funder...")
+        funder_info = await fetcher.analyze_funder(deployer, deployments)
+        if debug:
+            print(f"[DEBUG] Funder: {funder_info.get('funder_address')}")
 
-    chains_active = list(set(d["chain"] for d in deployments))
+        if debug:
+            print("[DEBUG] Calculating risk profile...")
+        risk_profile = fetcher.calculate_risk_profile(deployments, funder_info)
+        chains_active = ["solana"] if deployments else []
+    else:
+        fetcher = DeployerFetcher(api_keys, debug=debug)
+        if debug:
+            print(f"[DEBUG] Fetching deployment history across {chains_to_scan}")
+        deployments = await fetcher.get_deployment_history(deployer, chains_to_scan)
+        if debug:
+            print(f"[DEBUG] Found {len(deployments)} total deployments")
+
+        if debug:
+            print("[DEBUG] Analyzing funder...")
+        funder_info = await fetcher.analyze_funder(deployer, deployments, api_keys[0])
+        if debug:
+            print(f"[DEBUG] Funder: {funder_info.get('funder_address')}")
+
+        if debug:
+            print("[DEBUG] Calculating risk profile...")
+        risk_profile = fetcher.calculate_risk_profile(deployments, funder_info)
+        chains_active = list(set(d["chain"] for d in deployments))
+
+    nansen_keys = config.get("nansen", {}).get("api_keys", [])
+    nansen_data = {}
+    if nansen_keys and not is_sol:
+        if debug:
+            print(f"[DEBUG] Fetching Nansen reputation and label for {deployer}...")
+        try:
+            nansen_client = NansenClient(nansen_keys)
+            nansen_data = await fetch_nansen_deployer_data(deployer, "eth", nansen_client, debug=debug)
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Nansen fetch failed: {e}")
 
     profile = {
         "deployer": deployer.lower(),
@@ -76,7 +116,25 @@ async def run_deployer_analysis(
         "funder": funder_info,
         "deployments": deployments,
         "risk_profile": risk_profile,
+        "nansen": nansen_data,
     }
+
+    if len(deployments) == 0:
+        result = {
+            "reputation_score": 100,
+            "verdict": "CLEAN EOA / USER WALLET",
+            "recommendation": "SAFE – NOT A DEPLOYER",
+            "summary": "This address is a standard user wallet or transaction account. It has never deployed any smart contracts or tokens on-chain, meaning it carries no deployer-associated rug-pull risks.",
+            "red_flags": [],
+            "findings": []
+        }
+        await set_cached(deployer, cache_key, {"profile": profile, "result": result})
+        if stream:
+            async def _stream_fallback():
+                yield json.dumps(result)
+            return profile, _stream_fallback()
+        else:
+            return profile, result
 
     if debug:
         print("[DEBUG] Building AI prompt and calling OpenRouter...")
@@ -97,7 +155,8 @@ async def run_deployer_analysis(
         result = await client.complete(messages)
         if debug:
             print("[DEBUG] AI response received")
-        await set_cached(deployer, cache_key, {"profile": profile, "result": result})
+        if not isinstance(result, dict) or not result.get("is_fallback"):
+            await set_cached(deployer, cache_key, {"profile": profile, "result": result})
         return profile, result
 
 # ---------- Backward-compatible wrapper for Solana module ----------
