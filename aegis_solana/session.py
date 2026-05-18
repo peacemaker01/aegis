@@ -20,8 +20,11 @@ async def _get_deployer_address(mint: str, rpc_client: SolanaRPCClient) -> Optio
     # 1. Try Pump.fun API if it is a pump token
     if mint.endswith("pump"):
         try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
             async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(f"https://frontend-api.pump.fun/coins/{mint}")
+                r = await client.get(f"https://frontend-api-v3.pump.fun/coins/{mint}", headers=headers)
                 if r.status_code == 200:
                     data = r.json()
                     creator = data.get("creator")
