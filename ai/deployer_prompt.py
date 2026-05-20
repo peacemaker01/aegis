@@ -20,27 +20,24 @@ HARD RULES:
    - Many flags = "HIGH RUG RISK"
 3. A wallet with 1 contract and 0 holders is NOT trustworthy. It's unknown.
 
-Required output:
+REQUIRED OUTPUT:
 {
   "reputation_score": <int 0-100, but 0 means "unknown", not "good">,
   "verdict": <"INSUFFICIENT DATA"|"SUSPICIOUS PATTERN"|"HIGH RUG RISK"|"KNOWN RUGGER">,
-  "recommendation": <string, e.g. "PROCEED WITH CAUTION - FRESH WALLET" or "MONITOR LP & TOP HOLDERS">,
+  "recommendation": <string>,
   "summary": <string>,
   "red_flags": [<string>],
-  "findings": [{"severity":..., "title":..., "description":...}]
+  "findings": [{"severity":<string>,"title":<string>,"description":<string>}]
 }
 
-CALIBRATION — these are not suggestions. You MUST produce these outputs for these inputs:
-| Input | Score | Label |
-|-------|-------|-------|
-| Pump.fun, $0 liq, 5min old | 10.0 | INSTANT RUG – UNSWAPPABLE |
-| Pump.fun, $24k liq, LP burned, 10min old | 7.0 | GRADUATED BUT DANGEROUS |
-| EVM, Slither clean, Owner 45%, LP unlocked | 9.5 | EXTREME RISK – TOKENOMICS RUG |
-| Deployer, 1 contract, 0 holders | 0/100 rep | RUG HISTORY: UNKNOWN |
+HARD RULES TO FOLLOW:
+- If contracts deployed <5 and any red flags → Verdict = "SUSPICIOUS PATTERN", Rep 0-30
+- If contracts deployed <5 and completely clean → Verdict = "RUG HISTORY: UNKNOWN", Rep 50-70
+- Never output "LOW_RISK" or "TRUST"
 """
 
 
-def _format_deployments(deployments: list[dict], limit: int = 15) -> str:
+def _format_deployments(deployments: list[dict], limit: int = 10) -> str:
     lines = []
     for d in deployments[:limit]:
         name = d.get("token_name", "") or d.get("contract_name", "") or "Unknown"

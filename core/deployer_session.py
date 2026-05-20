@@ -1,6 +1,5 @@
 # core/deployer_session.py
 import json
-import asyncio
 from typing import AsyncGenerator, List, Optional
 
 from core.chains import CHAINS
@@ -12,6 +11,58 @@ from utils.validators import is_valid_address
 from utils.cache import get_cached, set_cached
 
 DEPLOYER_CACHE_KEY_PREFIX = "deployer_v2_nansen_"
+
+
+def _calculate_fallback_reputation(risk_profile: dict) -> dict:
+    """Calculate a basic reputation score from on-chain risk signals when AI fails."""
+    rep = 100
+    red_flags = []
+    findings = []
+    
+    # Each risk flag reduces score
+    unverified_ratio = float(risk_profile.get("unverified_ratio") or 0.0)
+    low_holder_ratio = float(risk_profile.get("low_holder_ratio") or 0.0)
+    rapid_burst = risk_profile.get("rapid_burst", False)
+    
+    if unverified_ratio > 0.5:
+        red_flags.append("high unverified ratio")
+        rep -= 30
+    elif unverified_ratio > 0.2:
+        red_flags.append("some unverified contracts")
+        rep -= 15
+    
+    if low_holder_ratio > 0.5:
+        red_flags.append("many low-holder contracts")
+        rep -= 25
+    elif low_holder_ratio > 0.2:
+        red_flags.append("some low-holder contracts")
+        rep -= 10
+    
+    if rapid_burst:
+        red_flags.append("rapid deployment burst detected")
+        rep -= 20
+    
+    # Determine verdict based on score
+    if rep >= 80:
+        verdict = "RUG HISTORY: UNKNOWN"
+        rec = "PROCEED WITH CAUTION - FRESH WALLET"
+    elif rep >= 50:
+        verdict = "SUSPICIOUS PATTERN"
+        rec = "MONITOR LP & TOP HOLDERS"
+    else:
+        verdict = "HIGH RUG RISK"
+        rec = "AVOID - MULTIPLE RISK SIGNALS"
+    
+    summary = f"On-chain risk analysis identified {len(red_flags)} red flag(s): {', '.join(red_flags) if red_flags else 'none'}."
+    
+    return {
+        "reputation_score": max(0, rep),
+        "verdict": verdict,
+        "recommendation": rec,
+        "summary": summary,
+        "red_flags": red_flags,
+        "findings": findings,
+    }
 
 async def run_deployer_analysis(
     deployer: str,
@@ -150,12 +201,42 @@ async def run_deployer_analysis(
     )
 
     if stream:
-        return profile, client.stream_audit(messages)
+        async def _stream_with_fallback():
+            """Wraps stream_audit to substitute on-chain fallback on AI failure."""
+            fallback_used = False
+            result_json = ""
+            async for chunk in client.stream_audit(messages):
+                result_json += chunk
+            try:
+                final_result = json.loads(result_json)
+                if final_result.get("is_fallback"):
+                    fallback_used = True
+                    final_result = _calculate_fallback_reputation(risk_profile)
+                    if debug:
+                        print("[DEBUG] Streaming fallback: using on-chain risk profile")
+            except json.JSONDecodeError:
+                fallback_used = True
+                final_result = _calculate_fallback_reputation(risk_profile)
+                if debug:
+                    print("[DEBUG] Streaming JSON parse failed: using on-chain risk profile")
+            if fallback_used:
+                await set_cached(deployer, cache_key, {"profile": profile, "result": final_result})
+                yield json.dumps(final_result)
+            else:
+                yield result_json
+        return profile, _stream_with_fallback()
     else:
         result = await client.complete(messages)
         if debug:
-            print("[DEBUG] AI response received")
-        if not isinstance(result, dict) or not result.get("is_fallback"):
+            print(f"[DEBUG] AI response received, is_fallback={result.get('is_fallback', False)}")
+        # If AI fallback triggered, use on-chain risk profile instead
+        if isinstance(result, dict) and result.get("is_fallback"):
+            if debug:
+                print("[DEBUG] AI fallback triggered, using on-chain risk profile")
+            result = _calculate_fallback_reputation(risk_profile)
+            await set_cached(deployer, cache_key, {"profile": profile, "result": result})
+        # Cache valid results (not fallbacks)
+        elif isinstance(result, dict) and not result.get("is_fallback"):
             await set_cached(deployer, cache_key, {"profile": profile, "result": result})
         return profile, result
 
