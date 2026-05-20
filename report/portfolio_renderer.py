@@ -1,5 +1,5 @@
 # report/portfolio_renderer.py
-"""Rich terminal renderers for wallet tracker + portfolio monitor."""
+"""Rich terminal renderers for portfolio monitor."""
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -11,7 +11,6 @@ from report.risk_scorer import risk_color, risk_label, bool_icon
 
 console = Console()
 
-GRADE_COLORS = {"A": "green", "B": "cyan", "C": "yellow", "D": "red", "F": "bold red"}
 ALERT_COLORS = {
     "NONE":     "dim",
     "INFO":     "cyan",
@@ -21,126 +20,6 @@ ALERT_COLORS = {
 ALERT_ICONS = {
     "NONE": "·", "INFO": "ℹ", "WARNING": "⚠", "CRITICAL": "🚨",
 }
-
-
-# ── Wallet Tracker ─────────────────────────────────────────────────────────────
-
-def render_wallet_report(data: dict) -> None:
-    snap     = data["wallet_snapshot"]
-    audited  = data["audited_holdings"]
-    analysis = data["portfolio_analysis"]
-    skipped  = data["skipped_count"]
-
-    wallet = snap["wallet"]
-    chain  = snap["chain"].upper()
-
-    console.print()
-    console.rule("[bold]Aegis — Wallet Risk Report[/bold]", style="cyan")
-    console.print(f"  [dim]Wallet:[/dim] {wallet}")
-    console.print(f"  [dim]Chain:[/dim]  {chain}")
-    console.print()
-
-    # ── Portfolio Score Panel ──────────────────────────────────────────────
-    score  = analysis.get("portfolio_risk_score", 0.0)
-    grade  = analysis.get("risk_grade", "?")
-    r_col  = risk_color(score)
-    g_col  = GRADE_COLORS.get(grade, "white")
-    bar    = "█" * int((score / 10) * 20) + "░" * (20 - int((score / 10) * 20))
-
-    pct_high = analysis.get("pct_high_risk", 0.0)
-    pct_safe = analysis.get("pct_safe", 0.0)
-
-    console.print(Panel(
-        f"Portfolio Risk Score: [{r_col}]{score:.1f} / 10[/{r_col}]  "
-        f"[dim]{bar}[/dim]\n"
-        f"Grade: [{g_col}]{grade}[/{g_col}]  ·  "
-        f"High-risk exposure: [{r_col}]{pct_high:.0f}%[/{r_col}]  ·  "
-        f"Safe: [green]{pct_safe:.0f}%[/green]",
-        title="[bold]Portfolio Risk[/bold]",
-        border_style=r_col,
-        padding=(0, 2),
-    ))
-    console.print()
-
-    # ── Holdings Table ─────────────────────────────────────────────────────
-    console.print(f"[bold]Token Holdings[/bold]  "
-                  f"[dim]({snap['token_count']} tokens, "
-                  f"audited top {len(audited)})[/dim]")
-
-    t = Table(box=box.SIMPLE, padding=(0, 1), show_header=True)
-    t.add_column("#",        width=3,  justify="right")
-    t.add_column("Token",    width=14, style="bold")
-    t.add_column("Symbol",   width=8)
-    t.add_column("Balance",  width=14, justify="right")
-    t.add_column("Score",    width=7,  justify="center")
-    t.add_column("Risk",     width=10)
-    t.add_column("Rec",      width=10)
-    t.add_column("Address",  width=14, style="dim")
-
-    for i, h in enumerate(audited, 1):
-        audit  = h.get("audit", {})
-        score_ = audit.get("risk_score", 0.0) or 0.0
-        rec    = audit.get("recommendation", "?")
-        r_c    = risk_color(score_)
-        rec_c  = {"SAFE": "green", "CAUTION": "yellow",
-                  "AVOID": "red"}.get(rec, "white")
-        name   = (h.get("token_name") or "?")[:12]
-        sym    = (h.get("token_symbol") or "?")[:7]
-        bal    = f"{h.get('balance', 0):,.4f}"
-        addr   = h.get("contract_address", "")
-        short  = addr[:6] + "…" + addr[-4:] if addr else "—"
-
-        t.add_row(
-            str(i), name, sym, bal,
-            f"[{r_c}]{score_:.1f}[/{r_c}]",
-            f"[{r_c}]{risk_label(score_)}[/{r_c}]",
-            f"[{rec_c}]{rec}[/{rec_c}]",
-            short,
-        )
-
-    console.print(t)
-
-    if skipped > 0:
-        console.print(
-            f"  [dim]+ {skipped} more tokens not audited "
-            f"(run aegis audit <address> --chain {snap['chain']} for full details)[/dim]"
-        )
-    console.print()
-
-    # ── Portfolio Findings ─────────────────────────────────────────────────
-    findings = analysis.get("findings", [])
-    if findings:
-        console.print("[bold]Portfolio Findings[/bold]")
-        sev_c = {"CRITICAL": "bold red", "HIGH": "red",
-                 "MEDIUM": "yellow",     "LOW": "cyan", "INFO": "dim"}
-        sev_i = {"CRITICAL": "🔴", "HIGH": "🟠",
-                 "MEDIUM": "🟡",  "LOW": "🔵", "INFO": "⚪"}
-        for f in findings:
-            s = f.get("severity", "INFO")
-            console.print(
-                f"  {sev_i.get(s,'•')} [{sev_c.get(s,'white')}]{s}[/{sev_c.get(s,'white')}]"
-                f"  [bold]{f.get('title','')}[/bold]"
-            )
-            console.print(f"     {f.get('description','')}")
-        console.print()
-
-    # ── Recommendations ────────────────────────────────────────────────────
-    recs = analysis.get("recommendations", [])
-    if recs:
-        console.print("[bold]Recommendations[/bold]")
-        for r in recs:
-            console.print(f"  [cyan]→[/cyan] {r}")
-        console.print()
-
-    # ── Summary ────────────────────────────────────────────────────────────
-    if summary := analysis.get("summary"):
-        console.print(Panel(summary, title="[bold]Summary[/bold]", border_style="dim"))
-    console.rule(style="dim")
-
-
-def render_wallet_spinner(wallet: str, chain: str) -> None:
-    console.print(f"\n[cyan]⟳[/cyan]  Fetching holdings for [bold]{wallet[:12]}…[/bold] on [bold]{chain.upper()}[/bold]")
-    console.print("[cyan]⟳[/cyan]  Auditing tokens (this may take 30-60s)…\n")
 
 
 # ── Portfolio Monitor ──────────────────────────────────────────────────────────

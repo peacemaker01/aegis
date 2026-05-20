@@ -14,7 +14,6 @@ from core.config import load_config, validate_config
 from core.db import init_db
 from core.session import run_scan
 from core.deployer_session import run_deployer_analysis
-from core.wallet_session import run_wallet_tracker
 from core.subscription import (
     get_or_create_user, can_use_service,
     process_verification, usage_logger, payment_verifier
@@ -72,32 +71,6 @@ async def require_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return False
 
-# ───────────────────── Helper keyboards ─────────────────────
-def _get_token_chain(token: dict) -> str:
-    chain = token.get("chain")
-    if isinstance(chain, dict):
-        slug = chain.get("slug") or chain.get("name") or ""
-        return slug.upper()[:6]
-    if isinstance(chain, str) and chain: return chain.upper()[:6]
-    return "?"
-
-def _build_token_keyboard(tokens: list, page: int = 0) -> list:
-    per_page, total_pages = 30, max(1, (len(tokens) + 29) // 30)
-    start, end = page * per_page, min(page * per_page + per_page, len(tokens))
-    page_tokens = tokens[start:end]
-    keyboard, row = [], []
-    for i, t in enumerate(page_tokens):
-        symbol = t.get("token_symbol") or t.get("symbol") or t.get("name") or "?"
-        chain_label = _get_token_chain(t)
-        global_idx = start + i
-        row.append(InlineKeyboardButton(f"{symbol} ({chain_label})", callback_data=f"audit_idx_{global_idx}"))
-        if len(row) == 3: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    nav_row = []
-    if page > 0: nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"wallet_page_{page-1}"))
-    if end < len(tokens): nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"wallet_page_{page+1}"))
-    if nav_row: keyboard.append(nav_row)
-    return keyboard
 
 ALLOWED_RISK_LABELS = {
     "INSTANT RUG – UNSWAPPABLE",
@@ -279,7 +252,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛡️ <b>AEGIS PREMIUM DASHBOARD</b>\n"
         f"<i>Your multi‑chain security edge</i>\n\n"
         f"📈 <b>Market Pulse:</b> Solana & EVM Trending\n"
-        f"🏥 <b>Portfolio Health:</b> AI Wallet Audit\n"
         f"🧠 <b>Entity Intelligence:</b> Deployer Forensics\n\n"
         f"🛡️ <b>AEGIS VERIFIED:</b> {status_color} {escape_html(status)}\n\n"
         f"Welcome back, {name}. System status: NOMINAL."
@@ -287,8 +259,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🔍 Scan Contract", callback_data="cmd_scan_prompt"),
          InlineKeyboardButton("⚠️ DEGEN FLOW", callback_data="cmd_degenflow")],
-        [InlineKeyboardButton("💼 Wallet Audit", callback_data="cmd_wallet_prompt"),
-         InlineKeyboardButton("🕵️ Deployer Check", callback_data="cmd_deployer_prompt")],
+        [InlineKeyboardButton("🕵️ Deployer Check", callback_data="cmd_deployer_prompt")],
         [InlineKeyboardButton("🤝 Trust Center", callback_data="cmd_trust"),
          InlineKeyboardButton("📊 Compare", callback_data="cmd_compare")],
         [InlineKeyboardButton("📋 Help Center", callback_data="cmd_help"),
@@ -934,7 +905,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fast_
     args = context.args or []
     query = update.callback_query
     if not args:
-        usage = "Usage: /scan <address> [chain]\nChain is auto‑detected for Solana (base58) and EVM (0x)."
+        usage = "Usage: /scan &lt;address&gt; [chain]\nChain is auto‑detected for Solana (base58) and EVM (0x)."
         if query: await query.message.edit_text(usage, parse_mode="HTML")
         else: await update.message.reply_text(usage, parse_mode="HTML")
         return
@@ -1099,7 +1070,7 @@ async def deployer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private_chat(update): return
     if not await require_subscription(update, context): return
     args = context.args
-    if not args: await update.effective_message.reply_text("Usage: /deployer <address>"); return
+    if not args: await update.effective_message.reply_text("Usage: /deployer &lt;address>"); return
     address = args[0]; user_id = update.effective_user.id; await usage_logger(user_id, "deployer", address)
     force_refresh = any(arg.lower() in ["force", "refresh", "--force"] for arg in args[1:])
     from utils.validators import is_solana_address
@@ -1152,112 +1123,6 @@ async def deployer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(reply, parse_mode="HTML")
     except Exception as e: logger.error(f"Deployer error: {e}"); await msg.edit_text(f"❌ Error: {escape_html(str(e))}", parse_mode="HTML")
 
-async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_private_chat(update): return
-    if not await require_subscription(update, context): return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /wallet <address>")
-        return
-
-    address = args[0]
-    user_id = update.effective_user.id
-    await usage_logger(user_id, "wallet", address)
-
-    msg = await update.message.reply_text(
-        f"💼 Scanning wallet <code>{escape_html(address)}</code> across all chains...",
-        parse_mode="HTML"
-    )
-
-    try:
-        data = await run_wallet_tracker(address, None, config, debug=DEBUG)
-        snapshot = data["wallet_snapshot"]
-        analysis = data["portfolio_analysis"]
-        audited = data["audited_holdings"]
-        all_tokens = snapshot.get("all_tokens", [])
-        total_value = snapshot.get("total_value_usd", 0)
-        total_tokens = snapshot.get("total_tokens", 0)
-
-        context.user_data["wallet_tokens"] = all_tokens
-        context.user_data["wallet_page"] = 0
-
-        score = analysis.get("portfolio_risk_score", "N/A") if analysis else "N/A"
-        grade = analysis.get("risk_grade", "?") if analysis else "?"
-        summary = analysis.get("summary", "No analysis available.") if analysis else "No analysis available."
-        pct_high = analysis.get("pct_high_risk", 0) if analysis else 0
-        pct_safe = analysis.get("pct_safe", 0) if analysis else 0
-        concentration = analysis.get("concentration_risk", False) if analysis else False
-
-        # ▸ Header
-        reply = (
-            f"<b>💼 Wallet Analysis</b>\n"
-            f"Address: <code>{escape_html(address)}</code>\n"
-            f"Total Value: ${total_value:,.2f}\n"
-            f"Tokens Found: {total_tokens}\n"
-            f"Audited (top 10 by value): {len(audited)}\n\n"
-            f"<b>Portfolio Risk Score:</b> {score}/10 (Grade {grade})\n\n"
-            f"📝 <b>Summary:</b>\n{escape_html(summary)}"
-        )
-
-        if data.get("_cached"):
-            reply += "\n\n<i>(served from cache)</i>"
-
-        # ▸ Risk breakdown
-        reply += (
-            f"\n\n<b>Risk Breakdown</b>\n"
-            f"• High‑risk holdings: {pct_high:.0f}%\n"
-            f"• Safe holdings: {pct_safe:.0f}%\n"
-            f"• Concentration risk: {'⚠️ Yes' if concentration else '✅ No'}"
-        )
-
-        # ▸ Top audited holdings table
-        if audited:
-            reply += "\n\n<b>Top Holdings (audited)</b>\n"
-            reply += "<pre>"
-            reply += f"{'Token':<20} {'Chain':<8} {'Value':>12} {'%':>6} {'Score':>6} {'Verdict':>10}\n"
-            reply += "─" * 70 + "\n"
-            for h in audited[:10]:
-                name = (h.get("token_name") or h.get("name") or h.get("token_address", "")[:8] + "…")[:18]
-                raw_chain = h.get("chain")
-                if isinstance(raw_chain, dict):
-                    chain = (raw_chain.get("slug") or raw_chain.get("name") or "?").upper()[:6]
-                elif isinstance(raw_chain, str) and raw_chain:
-                    chain = raw_chain.upper()[:6]
-                else:
-                    chain = "?"
-                value = float(h.get("usd_value", 0))
-                pct = (value / total_value * 100) if total_value > 0 else 0
-                score_val = h.get("audit", {}).get("risk_score", "?")
-                raw_verdict = h.get("audit", {}).get("recommendation", "?")
-                if len(raw_verdict) > 10:
-                    verdict = raw_verdict[:9] + "…"
-                else:
-                    verdict = raw_verdict
-                reply += f"{name:<20} {chain:<8} ${value:>10,.2f} {pct:>5.1f}% {score_val:>5}  {verdict:>10}\n"
-            reply += "</pre>"
-
-        # ▸ High‑risk flags
-        critical = analysis.get("critical_holdings", []) if analysis else []
-        if critical:
-            reply += "\n\n⚠️ <b>High‑Risk Holdings:</b>\n"
-            for addr in critical[:3]:
-                for h in audited:
-                    if h.get("token_address") == addr:
-                        name = h.get("token_name") or h.get("name") or addr[:10]
-                        score_val = h.get("audit", {}).get("risk_score", "?")
-                        reply += f"• {escape_html(name)} (score: {score_val}/10)\n"
-                        break
-
-        keyboard = _build_token_keyboard(all_tokens, page=0)
-        await msg.edit_text(
-            reply,
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            parse_mode="HTML"
-        )
-
-    except Exception as e:
-        logger.error(f"Wallet error: {e}")
-        await msg.edit_text(f"❌ Error: {escape_html(str(e))}", parse_mode="HTML")
 
 async def smartmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Backward-compatible wrapper – delegates to the new Degen Flow logic."""
@@ -1278,8 +1143,8 @@ async def degenflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args and args[0].lower() == "scan":
         if len(args) < 2:
-            if query: await query.message.edit_text("Usage: /degenflow scan <address>")
-            else: await update.message.reply_text("Usage: /degenflow scan <address>")
+            if query: await query.message.edit_text("Usage: /degenflow scan &lt;address>")
+            else: await update.message.reply_text("Usage: /degenflow scan &lt;address>")
             return
         context.args = args[1:]
         await scan_command(update, context, fast_mode=True)
@@ -1797,16 +1662,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<i>Chain is auto‑detected for Solana (base58) and EVM (0x).</i>",
             parse_mode="HTML",
         )
-    elif data == "cmd_wallet_prompt":
-        await query.answer()
-        await query.message.edit_text(
-            "<b>💼 Wallet Audit</b>\n\n"
-            "Type <code>/wallet 0x...</code> to audit any wallet's portfolio across all chains.\n\n"
-            "<b>Example:</b>\n"
-            "<code>/wallet 0xd8dA...6045</code>\n\n"
-            "<i>You'll see total value, tokens held, risk scores, and you can tap any token for a full audit.</i>",
-            parse_mode="HTML",
-        )
+
     elif data == "cmd_deployer_prompt":
         await query.answer()
         await query.message.edit_text(
@@ -1832,7 +1688,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>/scan &lt;address&gt; [chain]</b> — Fast security audit\n"
             "<b>/deepscan &lt;address&gt; [chain]</b> — Extended analysis\n"
             "<b>/deployer &lt;address&gt;</b> — Deployer forensics\n"
-            "<b>/wallet &lt;address&gt;</b> — Portfolio audit\n"
             "<b>/degenflow</b> — Solana risk feed\n"
             "<b>/trust</b> — The Aegis Trust Manifesto\n"
             "<b>/compare</b> — Aegis vs. Traditional Bots\n"
@@ -1939,26 +1794,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pdf_file = io.BytesIO(pdf_bytes); pdf_file.name = f"Aegis_Audit_{address[:10]}_{chain}.pdf"
             await context.bot.send_document(chat_id=update.effective_chat.id, document=pdf_file, caption=f"🛡️ Aegis Security Audit Report\n{address}\nChain: {chain.upper()}", filename=pdf_file.name)
         except Exception as e: await query.message.reply_text(f"❌ Failed to generate PDF: {escape_html(str(e))}")
-    elif data.startswith("audit_idx_"):
-        idx = int(data.split("_")[-1]); tokens = context.user_data.get("wallet_tokens", [])
-        if idx < len(tokens):
-            token = tokens[idx]; token_address = token.get("token_address")
-            token_chain = _get_token_chain(token).lower(); token_chain = "eth" if token_chain == "?" else token_chain
-            token_name = token.get("token_name") or token.get("name") or token.get("symbol") or token_address[:10]
-            token_symbol = token.get("token_symbol") or token.get("symbol") or ""
-            await query.answer(f"Auditing {token_name}...")
-            msg = await query.message.reply_text(f"🔍 Auditing <code>{escape_html(token_address)}</code> ({token_chain.upper()})...", parse_mode="HTML")
-            try:
-                contract, result = await run_scan(token_address, token_chain, config, fast_mode=True)
-                score = result.get("risk_score","N/A"); rec = result.get("recommendation","?"); summary = result.get("summary","No summary.")
-                display_name = contract.get("token_name") or token_name; display_symbol = contract.get("token_symbol") or token_symbol
-                await msg.edit_text(f"<b>🛡️ Token Audit: {escape_html(display_name)}{(' ('+escape_html(display_symbol)+')') if display_symbol else ''}</b>\n<code>{escape_html(token_address)}</code> ({token_chain.upper()})\nRisk Score: {score}/10\nVerdict: <b>{escape_html(rec)}</b>\n\n📝 {escape_html(summary)}", parse_mode="HTML")
-            except Exception as e: await msg.edit_text(f"❌ Audit failed: {escape_html(str(e))}")
-    elif data.startswith("wallet_page_"):
-        new_page = int(data.split("_")[-1]); context.user_data["wallet_page"] = new_page
-        tokens = context.user_data.get("wallet_tokens", [])
-        keyboard = _build_token_keyboard(tokens, page=new_page)
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
     else:
         await query.edit_message_text("I can explain that further. What specifically would you like to know?", parse_mode="HTML")
 
@@ -2084,7 +1920,6 @@ async def main_async():
         ("smartmoney", degenflow_command),
         ("scan", lambda u, c: scan_command(u, c, True)), ("deepscan", deepscan_command),
         ("deployer", deployer_command),
-        ("wallet", wallet_command),
         ("trust", trust_command),
         ("compare", compare_command),
         ("terms", terms_command),
