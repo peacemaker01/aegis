@@ -96,10 +96,13 @@ async def subscription_middleware(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["db_user"] = user
 
 
-async def process_verification(user_id: int, signature: str) -> dict:
+async def process_verification(user_id: int, signature: str, tier: str = "monthly") -> dict:
     """Verify payment, split tokens, activate subscription."""
     if await is_signature_used(signature):
         return {"success": False, "error": "This transaction has already been claimed."}
+
+    tier_config = config["subscription"]["tiers"].get(tier, config["subscription"]["tiers"]["monthly"])
+    payment_verifier.tier = tier  # Pass tier to verifier for price calculation
 
     result = await payment_verifier.verify_payment(signature)
     if not result["success"]:
@@ -121,7 +124,7 @@ async def process_verification(user_id: int, signature: str) -> dict:
         except Exception as e:
             print(f"Split error: {e}")
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=config["subscription"]["subscription_days"])
+    expires_at = datetime.now(timezone.utc) + timedelta(days=tier_config["days"])
     await update_user_subscription(user_id, expires_at, result["sender"])
 
     await log_subscription_event(
@@ -134,7 +137,7 @@ async def process_verification(user_id: int, signature: str) -> dict:
         split_tx_signature=split_sig
     )
 
-    return {"success": True, "expires_at": expires_at, "split_tx": split_sig}
+    return {"success": True, "expires_at": expires_at, "split_tx": split_sig, "tier": tier}
 
 
 async def usage_logger(user_id: int, command: str, address: str = "", chain: str = ""):

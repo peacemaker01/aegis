@@ -300,8 +300,8 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("1 Month ($14.99)", callback_data="cryptomus_pay_30")],
-        [InlineKeyboardButton("1 Year ($165.00)", callback_data="cryptomus_pay_365")]
+        [InlineKeyboardButton("1 Month ($79)", callback_data="cryptomus_pay_monthly")],
+        [InlineKeyboardButton("1 Year ($699)", callback_data="cryptomus_pay_yearly")]
     ]
     msg = (
         f"<b>💎 Subscribe to Aegis Premium</b>\n\n"
@@ -1625,8 +1625,13 @@ def _format_filters_display(filters: dict) -> str:
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); data = query.data
     if data.startswith("cryptomus_pay_"):
-        days = int(data.split("_")[-1])
-        amount_usd = 14.99 if days == 30 else 165.00
+        tier = data.split("_")[-1]  # monthly or yearly
+        if tier == "monthly":
+            days = 30
+            amount_usd = 79.0
+        else:
+            days = 365
+            amount_usd = 699.0
         order_id = str(uuid.uuid4())
         
         user_id = update.effective_user.id

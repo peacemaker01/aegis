@@ -63,7 +63,6 @@ config = load_config()
 
 TOKEN_MINT = Pubkey.from_string(config["solana"]["token_mint"])
 BURN_ADDRESS = Pubkey.from_string("11111111111111111111111111111111")
-REQUIRED_USD = config["subscription"]["price_usd"]
 TRANSACTION_TIMEOUT_MINUTES = 15
 
 # Safe loading of payment receiver
@@ -90,10 +89,12 @@ if _treasury:
 
 
 class PaymentVerifier:
-    def __init__(self, solana_client: SolanaClient):
+    def __init__(self, solana_client: SolanaClient, tier: str = "monthly"):
         self.client = solana_client
         self.payment_receiver = PAYMENT_RECEIVER
         self.token_mint = TOKEN_MINT
+        self.tier = tier
+        self._required_usd = config["subscription"]["tiers"].get(tier, config["subscription"]["tiers"]["monthly"])["price_usd"]
 
     async def get_token_price(self) -> float:
         price = await self.client.get_token_price(self.token_mint)
@@ -103,7 +104,7 @@ class PaymentVerifier:
 
     async def required_tokens(self) -> float:
         price = await self.get_token_price()
-        return REQUIRED_USD / price
+        return self._required_usd / price
 
     def extract_token_transfer(self, tx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not tx or "transaction" not in tx:

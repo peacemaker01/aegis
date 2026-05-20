@@ -62,9 +62,18 @@ def load_config() -> dict:
             "fluxrpc_api_key": os.getenv("FLUXRPC_API_KEY", ""),
         },
         "subscription": {
-            "price_usd": float(os.getenv("SUBSCRIPTION_PRICE_USD", "9.99")),
             "trial_days": int(os.getenv("TRIAL_DAYS", "3")),
-            "subscription_days": int(os.getenv("SUBSCRIPTION_DAYS", "30")),
+            "tiers": {
+                "monthly": {
+                    "price_usd": float(os.getenv("SUBSCRIPTION_PRICE_MONTHLY", "79")),
+                    "days": int(os.getenv("SUBSCRIPTION_DAYS_MONTHLY", "30")),
+                },
+                "yearly": {
+                    "price_usd": float(os.getenv("SUBSCRIPTION_PRICE_YEARLY", "699")),
+                    "days": int(os.getenv("SUBSCRIPTION_DAYS_YEARLY", "365")),
+                },
+            },
+            "default_tier": os.getenv("DEFAULT_SUBSCRIPTION_TIER", "monthly"),
         },
         "telegram": {
             "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
