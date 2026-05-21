@@ -168,8 +168,8 @@ class PaymentVerifier:
             "sender": transfer["source_owner"],
             "source_token_account": transfer["source_token_account"],
             "signature": signature,
-            "usd_value": REQUIRED_USD,
-        }
+"usd_value": self._required_usd,
+         }
 
 
 class TokenSplitter:

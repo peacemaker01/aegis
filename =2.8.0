@@ -1,0 +1,7 @@
+Requirement already satisfied: fpdf2 in /home/givi/.pyenv/versions/3.10.13/lib/python3.10/site-packages (2.8.7)
+Requirement already satisfied: defusedxml in /home/givi/.pyenv/versions/3.10.13/lib/python3.10/site-packages (from fpdf2) (0.7.1)
+Requirement already satisfied: fonttools>=4.34.0 in /home/givi/.pyenv/versions/3.10.13/lib/python3.10/site-packages (from fpdf2) (4.63.0)
+Requirement already satisfied: Pillow!=9.2.*,>=8.3.2 in /home/givi/.pyenv/versions/3.10.13/lib/python3.10/site-packages (from fpdf2) (12.2.0)
+
+[notice] A new release of pip is available: 23.0.1 -> 26.1.1
+[notice] To update, run: pip install --upgrade pip

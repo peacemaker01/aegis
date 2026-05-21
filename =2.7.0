@@ -1,0 +1,4 @@
+Requirement already satisfied: fpdf2 in ./venv/lib/python3.10/site-packages (2.8.7)
+Requirement already satisfied: defusedxml in ./venv/lib/python3.10/site-packages (from fpdf2) (0.7.1)
+Requirement already satisfied: Pillow!=9.2.*,>=8.3.2 in ./venv/lib/python3.10/site-packages (from fpdf2) (12.2.0)
+Requirement already satisfied: fonttools>=4.34.0 in ./venv/lib/python3.10/site-packages (from fpdf2) (4.62.1)

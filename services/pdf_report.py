@@ -6,24 +6,30 @@ Uses fpdf2 for lightweight, dependency-free PDF generation.
 import io
 import os
 import html
+import unicodedata
 from datetime import datetime, timezone
 from fpdf import FPDF
 
 
-def _get_unicode_font_path() -> str:
-    """Find a Unicode font (DejaVuSans) or fallback to built-in."""
-    import shutil
-    # Try system DejaVuSans locations
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/local/share/fonts/dejavu/DejaVuSans.ttf",
-        "/System/Library/Fonts/DejaVuSans.ttf",
-    ]:
-        if os.path.exists(path):
-            return path
-    # Fallback to helvetica (ASCII only, will strip unicode)
-    return ""
+def _get_unicode_font_paths() -> dict:
+    """Find all DejaVu font variants or return empty dict."""
+    paths = {}
+    locations = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", ""),
+        ("/usr/local/share/fonts/dejavu/DejaVuSans.ttf", ""),
+        ("/System/Library/Fonts/DejaVuSans.ttf", ""),
+    ]
+    for reg, _ in locations:
+        if os.path.exists(reg):
+            paths['regular'] = reg
+            paths['bold'] = reg.replace('DejaVuSans.ttf', 'DejaVuSans-Bold.ttf')
+            paths['italic'] = reg.replace('DejaVuSans.ttf', 'DejaVuSans-Oblique.ttf')
+            if not os.path.exists(paths['bold']):
+                paths['bold'] = ''
+            if not os.path.exists(paths['italic']):
+                paths['italic'] = ''
+            break
+    return paths
 
 
 class AegisPDFReport(FPDF):
@@ -34,19 +40,61 @@ class AegisPDFReport(FPDF):
         self.set_auto_page_break(True, 15)
         self._in_title = False
         
-        # Add Unicode font if available
-        font_path = _get_unicode_font_path()
-        if font_path:
-            self.add_font('DejaVu', '', font_path, uni=True)
-            self.default_font = 'DejaVu'
+        # Only use Unicode font if ALL required variants exist
+        font_paths = _get_unicode_font_paths()
+        self._use_unicode = False
+        if font_paths.get('regular') and font_paths.get('bold') and font_paths.get('italic'):
+            try:
+                self.add_font('DejaVu', '', font_paths['regular'], uni=True)
+                self.add_font('DejaVu', 'B', font_paths['bold'], uni=True)
+                self.add_font('DejaVu', 'I', font_paths['italic'], uni=True)
+                self.default_font = 'DejaVu'
+                self._use_unicode = True
+            except Exception:
+                self.default_font = 'Helvetica'
         else:
             self.default_font = 'Helvetica'
 
     def _safe_text(self, text: str) -> str:
-        """Sanitize text for PDF - encode to ASCII if no Unicode font."""
-        if hasattr(self, 'default_font') and self.default_font == 'DejaVu':
-            return str(text) if text else ''
-        return str(text).encode('ascii', 'replace').decode() if text else ''
+        """Convert Unicode text to safe ASCII for latin-1 encoding."""
+        if not text:
+            return ''
+        
+        text = str(text)
+        if hasattr(self, '_use_unicode') and self._use_unicode:
+            return text
+        
+        # Decompose accented characters
+        text = unicodedata.normalize('NFKD', text)
+        
+        # Replace common Unicode characters with ASCII equivalents
+        replacements = {
+            '\u2013': '-',      # en dash
+            '\u2014': '-',      # em dash
+            '\u2018': "'",      # left single quote
+            '\u2019': "'",      # right single quote
+            '\u201c': '"',      # left double quote
+            '\u201d': '"',      # right double quote
+            '\u2022': '*',      # bullet point
+            '\u2026': '...',    # ellipsis
+            '\u00a0': ' ',      # non-breaking space
+        }
+        for unicode_char, ascii_char in replacements.items():
+            text = text.replace(unicode_char, ascii_char)
+        
+        # Remove any remaining non-ASCII characters
+        text = text.encode('ascii', 'ignore').decode('ascii')
+        return text
+
+    def cell(self, w=0, h=0, txt="", border=0, ln=0, align="", fill=False, link=""):
+        """Override cell to ensure txt is always a safe string."""
+        txt = self._safe_text(str(txt)) if txt else ""
+        return super().cell(w, h, txt, border, ln, align, fill, link)
+
+    def multi_cell(self, w=0, h=0, txt="", border=0, align="", fill=False, split_only=False):
+        """Override multi_cell to ensure txt is always a safe string."""
+        txt = self._safe_text(str(txt)) if txt else ""
+        return super().multi_cell(w, h, txt, border, align, fill, split_only)
 
     def header(self):
         """Aegis branded header on every page."""
@@ -54,17 +102,17 @@ class AegisPDFReport(FPDF):
             # Title page header
             self.set_font(self.default_font, 'B', 22)
             self.set_text_color(30, 64, 175)   # deep blue
-            self.cell(0, 12, 'AEGIS', align='C', new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 12, 'AEGIS', align='C', ln=1)
             self.set_font(self.default_font, '', 12)
             self.set_text_color(100, 100, 100)
-            self.cell(0, 8, 'Security Audit Report', align='C', new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 8, 'Security Audit Report', align='C', ln=1)
             self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
             self.ln(6)
         else:
             # Continuation page header
             self.set_font(self.default_font, 'I', 8)
             self.set_text_color(128, 128, 128)
-            self.cell(0, 5, 'Aegis Security Audit Report (continued)', align='R', new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 5, 'Aegis Security Audit Report (continued)', align='R', ln=1)
             self.ln(2)
 
     def footer(self):
@@ -75,13 +123,12 @@ class AegisPDFReport(FPDF):
         self.cell(0, 10, f'Page {self.page_no()}/{{nb}} | Generated by Aegis Security Bot | aegis.app', align='C')
 
     def write_section_title(self, title: str):
-        """Write a bold section title."""
-        self.set_font(self.default_font, 'B', 13)
-        self.set_text_color(30, 64, 175)
-        self.cell(0, 9, self._safe_text(title), new_x="LMARGIN", new_y="NEXT")
-        self.set_draw_color(30, 64, 175)
-        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
-        self.ln(4)
+        """Write a styled header banner for a section."""
+        self.set_fill_color(30, 64, 175)
+        self.set_text_color(255, 255, 255)
+        self.set_font(self.default_font, 'B', 10)
+        self.cell(0, 7, f"  {self._safe_text(title)}", fill=True, ln=1)
+        self.ln(3)
 
     def write_body(self, text: str):
         """Write body text."""
@@ -97,7 +144,7 @@ class AegisPDFReport(FPDF):
         self.cell(50, 6, f'{self._safe_text(key)}:', align='R')
         self.set_font(self.default_font, '', 10)
         self.set_text_color(50, 50, 50)
-        self.cell(0, 6, self._safe_text(value), new_x="LMARGIN", new_y="NEXT")
+        self.cell(0, 6, self._safe_text(value), ln=1)
 
     def write_risk_bar(self, score: float):
         """Draw a visual risk score bar."""
@@ -108,7 +155,7 @@ class AegisPDFReport(FPDF):
             self.set_text_color(234, 179, 8)
         else:
             self.set_text_color(22, 163, 74)
-        self.cell(0, 15, f'{score:.1f} / 10', align='C', new_x="LMARGIN", new_y="NEXT")
+        self.cell(0, 15, f'{score:.1f} / 10', align='C', ln=1)
         # Visual bar
         bar_width = 140
         bar_height = 8
@@ -171,6 +218,204 @@ class AegisPDFReport(FPDF):
         self.ln(4)
 
 
+    def write_detailed_findings(self, findings: list):
+        """Write detailed findings cards."""
+        if not findings:
+            return
+        
+        for f in findings:
+            if not isinstance(f, dict) or "_slither_human_summary" in f or "_slither_vars_and_auth" in f or "_slither_metadata" in f:
+                continue
+                
+            severity = str(f.get('severity', 'INFO')).upper()
+            title = str(f.get('title', f.get('detector', 'Vulnerability')))
+            description = str(f.get('description', ''))
+            swc_id = str(f.get('swc_id', ''))
+            locations = f.get('locations', [])
+
+            # Check if page break is needed
+            if self.get_y() > 240:
+                self.add_page()
+
+            # Set color coding by severity
+            if severity == 'CRITICAL':
+                self.set_fill_color(220, 38, 38)
+                self.set_text_color(255, 255, 255)
+            elif severity == 'HIGH':
+                self.set_fill_color(239, 68, 68)
+                self.set_text_color(255, 255, 255)
+            elif severity == 'MEDIUM':
+                self.set_fill_color(245, 158, 11)
+                self.set_text_color(255, 255, 255)
+            elif severity == 'LOW':
+                self.set_fill_color(254, 243, 199)
+                self.set_text_color(180, 83, 9)
+            else:
+                self.set_fill_color(243, 244, 246)
+                self.set_text_color(75, 85, 99)
+
+            # Header details
+            pill_text = f" {severity} "
+            if swc_id:
+                pill_text += f" | {swc_id}"
+            
+            # Print severity block
+            self.set_font(self.default_font, 'B', 9)
+            self.cell(40, 7, pill_text, fill=True, align='C')
+            
+            # Print title
+            self.set_fill_color(245, 247, 250)
+            self.set_text_color(30, 64, 175)
+            self.set_font(self.default_font, 'B', 9)
+            self.cell(0, 7, f"  {title}", fill=True, ln=1)
+
+            # Draw card body: description & locations
+            self.set_font(self.default_font, '', 9)
+            self.set_text_color(55, 65, 81)
+            
+            # Nest description with indent
+            self.set_x(self.l_margin + 4)
+            body_width = self.w - self.l_margin - self.r_margin - 8
+            self.multi_cell(body_width, 4.5, self._safe_text(description))
+
+            # Locations line
+            if locations:
+                loc_strings = []
+                for loc in locations:
+                    if not isinstance(loc, dict):
+                        continue
+                    fname = loc.get('filename')
+                    line = loc.get('line')
+                    if fname:
+                        loc_strings.append(f"{fname}:{line}" if line else fname)
+                if loc_strings:
+                    loc_text = "Locations: " + ", ".join(loc_strings)
+                    self.set_x(self.l_margin + 4)
+                    self.set_font(self.default_font, 'I', 8)
+                    self.set_text_color(107, 114, 128)
+                    self.multi_cell(body_width, 4, self._safe_text(loc_text))
+            
+            self.ln(2)
+
+    def write_goplus_details(self, goplus: dict):
+        """Write detailed GoPlus security parameters in grid format."""
+        if not goplus or not goplus.get('goplus_available'):
+            return
+
+        self.write_section_title("DETAILED ON-CHAIN SECURITY (GOPLUS)")
+
+        # Parameters to print
+        parameters = [
+            ("Honeypot Status", goplus.get("gp_is_honeypot", False), False, "Cannot sell/exit"),
+            ("Mintable Contract", goplus.get("gp_is_mintable", False), False, "Inflation/dump risk"),
+            ("Can Be Minted", goplus.get("gp_can_be_minted", False), False, "Token minting active"),
+            ("Owner Balance Modifiable", goplus.get("gp_owner_change_balance", False), False, "Owner can alter balances"),
+            ("Selfdestruct Present", goplus.get("gp_selfdestruct", False), False, "Contract can be destroyed"),
+            ("External Call Risk", goplus.get("gp_external_call", False), False, "Calls untrusted contracts"),
+            ("Trading Cooldown", goplus.get("gp_trading_cooldown", False), False, "Time-lock cooldowns"),
+            ("Transfer Pausable", goplus.get("gp_transfer_pausable", False), False, "Transfers can be paused"),
+            ("Blacklist Present", goplus.get("gp_is_blacklisted", False), False, "Addresses can be blocked"),
+            ("Whitelist Present", goplus.get("gp_is_whitelisted", False), False, "Only whitelist can trade"),
+            ("Anti-Whale Mechanics", goplus.get("gp_is_anti_whale", False), False, "Limits size/holding"),
+            ("Slippage Modifiable", goplus.get("gp_slippage_modifiable", False), False, "Owner can change tax"),
+            ("Hidden Owner", goplus.get("gp_hidden_owner", False), False, "Undocumented admin backdoors"),
+            ("Reclaim Ownership", goplus.get("gp_take_back_ownership", False), False, "Owner can regain control"),
+            ("Cannot Sell All", goplus.get("gp_cannot_sell_all", False), False, "Exit limits on selling"),
+            ("Cannot Buy", goplus.get("gp_cannot_buy", False), False, "Purchase restrictions"),
+        ]
+
+        def get_status_str(val: bool, invert: bool) -> str:
+            if invert:
+                return "SAFE" if not val else "RISK"
+            return "RISK" if val else "SAFE"
+            
+        def get_status_color(val: bool, invert: bool) -> tuple:
+            is_risk = val if not invert else not val
+            return (220, 38, 38) if is_risk else (22, 163, 74)
+
+        # 2-column layout
+        x_col1 = self.l_margin
+        x_col2 = self.w / 2 + 1
+        col_width = (self.w - self.l_margin - self.r_margin) / 2 - 2
+        
+        y_start = self.get_y()
+        y_current = y_start
+        for idx, (label, val, invert, desc) in enumerate(parameters):
+            is_right = idx % 2 == 1
+            if not is_right:
+                if self.get_y() > 250:
+                    self.add_page()
+                y_current = self.get_y()
+                self.set_xy(x_col1, y_current)
+            else:
+                self.set_xy(x_col2, y_current)
+
+            # Label
+            self.set_font(self.default_font, 'B', 8.5)
+            self.set_text_color(55, 65, 81)
+            self.cell(42, 5, self._safe_text(label))
+            
+            # Status
+            status_text = get_status_str(val, invert)
+            r, g, b = get_status_color(val, invert)
+            self.set_text_color(r, g, b)
+            self.cell(12, 5, status_text)
+            
+            # Desc
+            self.set_font(self.default_font, 'I', 7.5)
+            self.set_text_color(156, 163, 175)
+            self.cell(39, 5, f"({desc})", ln=1 if is_right else 0)
+        
+        if len(parameters) % 2 == 1:
+            self.ln(5)
+        else:
+            self.ln(2)
+
+        # Reset formatting
+        self.set_text_color(50, 50, 50)
+        self.ln(4)
+
+        # Draw details table
+        self.write_section_title("TRANSACTION TAX & DISTRIBUTION (GOPLUS)")
+        
+        buy_tax = goplus.get("gp_buy_tax", 0.0)
+        sell_tax = goplus.get("gp_sell_tax", 0.0)
+        owner_percent = goplus.get("gp_owner_percent", 0.0)
+        creator_percent = goplus.get("gp_creator_percent", 0.0)
+        
+        buy_tax_str = f"{buy_tax * 100:.1f}%" if buy_tax else "0.0%"
+        sell_tax_str = f"{sell_tax * 100:.1f}%" if sell_tax else "0.0%"
+        owner_pct_str = f"{owner_percent * 100:.2f}%" if owner_percent else "0.00%"
+        creator_pct_str = f"{creator_percent * 100:.2f}%" if creator_percent else "0.00%"
+        
+        self.write_key_value("Buy Tax", buy_tax_str)
+        self.write_key_value("Sell Tax", sell_tax_str)
+        self.write_key_value("Owner Address", goplus.get("gp_owner_address", "N/A"))
+        self.write_key_value("Owner Holdings", owner_pct_str)
+        self.write_key_value("Creator Address", goplus.get("gp_creator_address", "N/A"))
+        self.write_key_value("Creator Holdings", creator_pct_str)
+        self.write_key_value("Holder Count", str(goplus.get("gp_holder_count", "N/A")))
+        self.write_key_value("LP Holder Count", str(goplus.get("gp_lp_holder_count", "N/A")))
+        self.write_key_value("Total Supply", str(goplus.get("gp_total_supply", "N/A")))
+        self.ln(4)
+
+    def write_slither_printers(self, human_summary: str, vars_auth: str):
+        """Write Slither printer outputs if present."""
+        if human_summary and human_summary.strip():
+            self.write_section_title("SLITHER CONTRACT SUMMARY")
+            self.set_font(self.default_font, '', 8.5)
+            self.set_text_color(55, 65, 81)
+            self.multi_cell(0, 4.5, self._safe_text(human_summary.strip()))
+            self.ln(4)
+            
+        if vars_auth and vars_auth.strip():
+            self.write_section_title("SLITHER VARIABLES & AUTHORIZATION")
+            self.set_font(self.default_font, '', 8.5)
+            self.set_text_color(55, 65, 81)
+            self.multi_cell(0, 4.5, self._safe_text(vars_auth.strip()))
+            self.ln(4)
+
+
 def generate_audit_pdf(
     address: str,
     chain: str,
@@ -186,16 +431,21 @@ def generate_audit_pdf(
     pdf.add_page()
 
     score = result.get('risk_score', 0) or 0
-    rec = result.get('recommendation', 'CAUTION')
-    summary = result.get('summary', 'No summary available.')
+    rec = str(result.get('recommendation', 'CAUTION'))
+    summary = str(result.get('summary', 'No summary available.'))
+
+    # Sanitize user data early
+    rec = pdf._safe_text(rec)
+    summary = pdf._safe_text(summary)
 
     token_name = (contract or {}).get('token_name', '') or address[:10] + '...'
+    token_name = pdf._safe_text(token_name)
 
     # ── Title block ────────────────────────────────────────────────
     pdf.ln(5)
     pdf.set_font(pdf.default_font, '', 11)
     pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 7, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), align='C', new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), align='C', ln=1)
     pdf.ln(8)
 
     # ── Contract info ──────────────────────────────────────────────
@@ -226,18 +476,12 @@ def generate_audit_pdf(
         pdf.set_text_color(234, 179, 8)
     else:
         pdf.set_text_color(22, 163, 74)
-    pdf.cell(0, 10, f'VERDICT: {rec}', align='C', new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f'VERDICT: {rec}', align='C', ln=1)
     pdf.ln(6)
 
     # ── Executive summary ──────────────────────────────────────────
     pdf.write_section_title('EXECUTIVE SUMMARY')
     pdf.write_body(summary)
-
-    # ── Findings table ─────────────────────────────────────────────
-    consensus = result.get('consensus_findings', [])
-    single = result.get('single_tool_findings', result.get('single_source_findings', []))
-    all_findings = consensus + single
-    pdf.write_findings_table(all_findings, 'DETAILED FINDINGS')
 
     # ── Security flags ─────────────────────────────────────────────
     pdf.write_section_title('SECURITY FLAGS')
@@ -267,8 +511,42 @@ def generate_audit_pdf(
         pdf.set_font(pdf.default_font, 'B', 10)
         pdf.cell(60, 6, f'{label}:', align='R')
         pdf.set_font(pdf.default_font, '', 10)
-        pdf.cell(0, 6, status, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, status, ln=1)
     pdf.ln(4)
+
+    # ── GoPlus Details (if available) ──────────────────────────────
+    goplus = result.get('_raw', {}).get('goplus', {})
+    if goplus and goplus.get('goplus_available'):
+        pdf.write_goplus_details(goplus)
+
+    # ── AI Core Findings (table format) ────────────────────────────
+    consensus = result.get('consensus_findings', [])
+    single = result.get('single_tool_findings', result.get('single_source_findings', []))
+    all_findings = consensus + single
+    if all_findings:
+        pdf.write_findings_table(all_findings, 'AI CORE FINDINGS')
+
+    # ── Next section page-break check ──
+    # Draw Slither details if any findings exist
+    raw_slither = result.get('_raw', {}).get('slither', [])
+    slither_findings = [
+        f for f in raw_slither 
+        if isinstance(f, dict) and "_slither_human_summary" not in f and "_slither_vars_and_auth" not in f and "_slither_metadata" not in f
+    ]
+    if slither_findings:
+        pdf.write_section_title("DETAILED STATIC ANALYSIS FINDINGS (SLITHER)")
+        pdf.write_detailed_findings(slither_findings)
+
+    # ── Slither printers ───────────────────────────────────────────
+    human_summary = ""
+    vars_auth = ""
+    for f in raw_slither:
+        if isinstance(f, dict):
+            if "_slither_human_summary" in f:
+                human_summary = f["_slither_human_summary"]
+            elif "_slither_vars_and_auth" in f:
+                vars_auth = f["_slither_vars_and_auth"]
+    pdf.write_slither_printers(human_summary, vars_auth)
 
     # ── Positive signals ───────────────────────────────────────────
     positives = result.get('positive_signals', [])
@@ -277,7 +555,7 @@ def generate_audit_pdf(
         for p in positives:
             pdf.set_font(pdf.default_font, '', 10)
             pdf.set_text_color(22, 163, 74)
-            pdf.cell(0, 6, f'   {p}', new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 6, f'   {pdf._safe_text(p)}', ln=1)
         pdf.ln(4)
 
     # ── Disclaimer ────────────────────────────────────────────────
@@ -290,7 +568,16 @@ def generate_audit_pdf(
         align='C'
     )
 
-    return bytes(pdf.output())
+    import fpdf
+    major = int(getattr(fpdf, "__version__", "1").split(".")[0])
+    if major >= 2:
+        return bytes(pdf.output())
+    else:
+        res = pdf.output(dest='S')
+        if isinstance(res, str):
+            return res.encode('latin-1')
+        return bytes(res)
+
 
 
 async def send_pdf_report(update, context, address: str, chain: str, result: dict, contract: dict = None):
