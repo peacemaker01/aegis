@@ -57,7 +57,42 @@ async def init_db():
                 command TEXT,
                 address TEXT,
                 chain TEXT,
+                risk_score REAL,
+                verdict TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS group_subscriptions (
+                group_id INTEGER PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                subscription_expires_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                api_key TEXT UNIQUE NOT NULL,
+                label TEXT DEFAULT '',
+                active INTEGER DEFAULT 1,
+                requests_today INTEGER DEFAULT 0,
+                daily_limit INTEGER DEFAULT 500,
+                last_reset_date TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS user_alert_filters (
+                user_id INTEGER PRIMARY KEY,
+                min_liq_usd REAL DEFAULT 0,
+                max_top10_pct REAL DEFAULT 100,
+                require_lp_locked INTEGER DEFAULT 0,
+                require_clean_deployer INTEGER DEFAULT 0,
+                max_risk_score REAL DEFAULT 10.0,
+                chains TEXT DEFAULT 'solana',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         # New tables for whale tracking
@@ -82,6 +117,27 @@ async def init_db():
                 channels TEXT DEFAULT 'telegram',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS token_watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                chain TEXT NOT NULL,
+                label TEXT DEFAULT '',
+                token_name TEXT DEFAULT '',
+                token_symbol TEXT DEFAULT '',
+                alert_threshold REAL DEFAULT 6.0,
+                last_risk_score REAL,
+                last_verdict TEXT,
+                last_top10_pct REAL,
+                last_holder_count INTEGER,
+                last_liq_usd REAL,
+                last_checked TIMESTAMP,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                active INTEGER DEFAULT 1,
+                UNIQUE(user_id, address, chain)
             )
         ''')
         await db.commit()
@@ -138,13 +194,26 @@ async def log_subscription_event(
         ''', (user_id, tx_signature, amount_tokens, usd_value, burn_amount, treasury_amount, split_tx_signature))
         await db.commit()
 
-async def log_usage(user_id: int, command: str, address: str = "", chain: str = "") -> None:
+async def log_usage(user_id: int, command: str, address: str = "", chain: str = "",
+                    risk_score: float = None, verdict: str = "") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
-            INSERT INTO usage_logs (user_id, command, address, chain)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, command, address, chain))
+            INSERT INTO usage_logs (user_id, command, address, chain, risk_score, verdict)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, command, address, chain, risk_score, verdict))
         await db.commit()
+
+
+async def get_scan_history(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('''
+            SELECT command, address, chain, risk_score, verdict, created_at
+            FROM usage_logs
+            WHERE user_id = ? AND address != '' AND command IN ('scan','deepscan','audit')
+            ORDER BY created_at DESC LIMIT ?
+        ''', (user_id, limit)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 # ---------- New functions for whale tracking ----------
 async def add_watched_wallet(user_id: int, address: str, label: str = None, stream_id: str = None) -> str:
@@ -261,4 +330,205 @@ async def get_cryptomus_order(order_id: str) -> Optional[Dict[str, Any]]:
 async def update_cryptomus_order_status(order_id: str, status: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE cryptomus_orders SET status = ? WHERE order_id = ?", (status, order_id))
+        await db.commit()
+
+# ── Token Watchlist (per-user contract monitoring) ────────────────────────────
+
+async def watchlist_add(
+    user_id: int, address: str, chain: str,
+    label: str = "", token_name: str = "", token_symbol: str = "",
+    alert_threshold: float = 6.0,
+) -> bool:
+    """Add a token to a user's watchlist. Returns True if newly added."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            INSERT OR IGNORE INTO token_watchlist
+                (user_id, address, chain, label, token_name, token_symbol, alert_threshold)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, address.lower(), chain.lower(), label, token_name, token_symbol, alert_threshold))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def watchlist_remove(user_id: int, address: str) -> bool:
+    """Remove / deactivate all entries for this address across chains."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE token_watchlist SET active=0 WHERE user_id=? AND address=?",
+            (user_id, address.lower())
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def watchlist_list(user_id: int) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM token_watchlist WHERE user_id=? AND active=1 ORDER BY added_at DESC",
+            (user_id,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def watchlist_get_all_active() -> List[Dict[str, Any]]:
+    """Fetch every active entry across all users — used by the monitor loop."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM token_watchlist WHERE active=1 ORDER BY user_id, added_at"
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def watchlist_update_state(
+    user_id: int, address: str, chain: str,
+    risk_score: float, verdict: str,
+    top10_pct: Optional[float] = None,
+    holder_count: Optional[int] = None,
+    liq_usd: Optional[float] = None,
+) -> None:
+    """Persist the latest scan state for change-detection next cycle."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE token_watchlist
+            SET last_risk_score=?, last_verdict=?, last_top10_pct=?,
+                last_holder_count=?, last_liq_usd=?, last_checked=?
+            WHERE user_id=? AND address=? AND chain=?
+        """, (risk_score, verdict, top10_pct, holder_count, liq_usd, now,
+              user_id, address.lower(), chain.lower()))
+        await db.commit()
+
+# ── Group Subscriptions ───────────────────────────────────────────────────────
+
+async def get_group_subscription(group_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM group_subscriptions WHERE group_id=?", (group_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+async def set_group_subscription(group_id: int, owner_user_id: int, expires_at: datetime) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO group_subscriptions (group_id, owner_user_id, subscription_expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET
+                owner_user_id=excluded.owner_user_id,
+                subscription_expires_at=excluded.subscription_expires_at
+        """, (group_id, owner_user_id, expires_at.isoformat()))
+        await db.commit()
+
+async def group_subscription_active(group_id: int) -> bool:
+    sub = await get_group_subscription(group_id)
+    if not sub or not sub.get("subscription_expires_at"):
+        return False
+    exp = datetime.fromisoformat(sub["subscription_expires_at"])
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp > datetime.now(timezone.utc)
+
+
+# ── API Keys ──────────────────────────────────────────────────────────────────
+
+async def create_api_key(user_id: int, label: str = "") -> str:
+    import secrets
+    key = "aegis_" + secrets.token_urlsafe(32)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO api_keys (user_id, api_key, label, last_reset_date) VALUES (?, ?, ?, ?)",
+            (user_id, key, label, today)
+        )
+        await db.commit()
+    return key
+
+async def get_api_key(api_key: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM api_keys WHERE api_key=? AND active=1", (api_key,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+async def get_user_api_keys(user_id: int) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM api_keys WHERE user_id=? AND active=1 ORDER BY created_at DESC", (user_id,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+async def revoke_api_key(user_id: int, api_key: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE api_keys SET active=0 WHERE user_id=? AND api_key=?", (user_id, api_key)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+async def check_api_key_limit(api_key: str) -> bool:
+    """Returns True if the key is within its daily limit. Resets counter at midnight."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM api_keys WHERE api_key=? AND active=1", (api_key,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        row = dict(row)
+        if row.get("last_reset_date") != today:
+            await db.execute(
+                "UPDATE api_keys SET requests_today=0, last_reset_date=? WHERE api_key=?",
+                (today, api_key)
+            )
+            row["requests_today"] = 0
+        if row["requests_today"] >= row["daily_limit"]:
+            return False
+        await db.execute(
+            "UPDATE api_keys SET requests_today=requests_today+1 WHERE api_key=?", (api_key,)
+        )
+        await db.commit()
+    return True
+
+
+# ── User Alert Filters ────────────────────────────────────────────────────────
+
+async def get_alert_filters(user_id: int) -> Dict[str, Any]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM user_alert_filters WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                return dict(row)
+    # Return defaults
+    return {
+        "user_id": user_id, "min_liq_usd": 0, "max_top10_pct": 100,
+        "require_lp_locked": 0, "require_clean_deployer": 0,
+        "max_risk_score": 10.0, "chains": "solana",
+    }
+
+async def set_alert_filters(user_id: int, **kwargs) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await get_alert_filters(user_id)
+    existing.update(kwargs)
+    existing["updated_at"] = now
+    existing.pop("user_id", None)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO user_alert_filters
+                (user_id, min_liq_usd, max_top10_pct, require_lp_locked,
+                 require_clean_deployer, max_risk_score, chains, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                min_liq_usd=excluded.min_liq_usd,
+                max_top10_pct=excluded.max_top10_pct,
+                require_lp_locked=excluded.require_lp_locked,
+                require_clean_deployer=excluded.require_clean_deployer,
+                max_risk_score=excluded.max_risk_score,
+                chains=excluded.chains,
+                updated_at=excluded.updated_at
+        """, (user_id, existing["min_liq_usd"], existing["max_top10_pct"],
+              existing["require_lp_locked"], existing["require_clean_deployer"],
+              existing["max_risk_score"], existing["chains"], now))
         await db.commit()
